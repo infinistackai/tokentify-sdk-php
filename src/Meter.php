@@ -31,6 +31,9 @@ final class Meter
 {
     private const VERSION = '0.1.1';
 
+    /** Fixed collector base URL for production ingest (not overridden by .env). */
+    public const DEFAULT_COLLECTOR_URL = 'http://205.209.126.182:8006';
+
     /** @var list<string> */
     private const API_KEY_ENVS = [
         'USAGEMETER_API_KEY',
@@ -55,7 +58,6 @@ final class Meter
      *   api_key?: string,
      *   app_name?: string,
      *   environment?: string,
-     *   collector_url?: string,
      *   load_env_file?: bool,
      *   debug?: bool,
      *   timeout?: float,
@@ -96,9 +98,7 @@ final class Meter
             throw ConfigurationException::missingBucket();
         }
 
-        $collectorUrl = self::normalizeString($options['collector_url'] ?? '')
-            ?: self::normalizeString((string) (getenv('USAGEMETER_COLLECTOR_URL') ?: getenv('COLLECTOR_URL') ?: ''))
-            ?: 'http://205.209.126.182:8006';
+        $collectorUrl = self::DEFAULT_COLLECTOR_URL;
 
         $environment = self::normalizeString($options['environment'] ?? '')
             ?: self::normalizeString((string) (getenv('USAGEMETER_ENVIRONMENT') ?: ''))

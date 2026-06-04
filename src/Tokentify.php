@@ -33,7 +33,6 @@ final class Tokentify
      *   bucket?: string,
      *   app_name?: string,
      *   environment?: string,
-     *   collector_url?: string,
      *   load_env_file?: bool,
      *   debug?: bool,
      *   timeout?: float,

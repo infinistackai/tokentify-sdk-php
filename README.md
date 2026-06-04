@@ -18,7 +18,7 @@ composer require vlucas/phpdotenv
 
 ### 1. Environment (API key is global)
 
-Copy `.env.example` to `.env`. The **API key lives only in `.env`** (or your deployment environment)—not in application `init()` code.
+Copy `.env.example` to `.env`. The **API key lives only in `.env`** (or your deployment environment)—never in `init()` code.
 
 ```bash
 cp .env.example .env
@@ -27,46 +27,26 @@ cp .env.example .env
 ```bash
 # .env — required
 USAGEMETER_API_KEY=your_ingest_api_key
-USAGEMETER_BUCKET=my-bucket
-
-# optional (SDK default if unset)
-USAGEMETER_COLLECTOR_URL=http://205.209.126.182:8006
+USAGEMETER_BUCKET=your_bucket_name
 ```
 
-| Variable | Required | Where to set |
-|----------|----------|----------------|
-| `USAGEMETER_API_KEY` | **Yes** | `.env` only (global secret) |
-| `USAGEMETER_BUCKET` | Yes* | `.env` or `init()` bucket argument |
-| `USAGEMETER_COLLECTOR_URL` | No | Default `http://205.209.126.182:8006`; override in `.env` |
-| `USAGEMETER_ENVIRONMENT` | No | `.env` (default `production`) |
-| `USAGEMETER_APP_NAME` | No | `.env` |
-
-\*Bucket: set in `.env` **or** pass to `Tokentify::init()` / `Meter::init()`.
-
-API key aliases: `UM_API_KEY`, `USAGEMETER_TOKEN`, `UM_TOKEN`.
-
-When [`vlucas/phpdotenv`](https://github.com/vlucas/phpdotenv) is installed, `init()` loads `.env` from the working directory automatically (`load_env_file` default `true`). Set `load_env_file => false` in frameworks that already load env vars.
-
 ### 2. Initialize
-
-Use **`Tokentify::init()`** (recommended). It requires **`tracking_fields`** including **`account_id`** and **`user_id`** for flat `group_key_*` / `group_value_*` metadata (same model as the Python/Node SDKs).
 
 ```php
 <?php
 
 use UsageMeter\Tokentify;
-use UsageMeter\Meter;
 
 require __DIR__ . '/vendor/autoload.php';
 
-// API key from .env; bucket + tracking fields from arguments
-Tokentify::init('my-bucket', ['account_id', 'user_id']);
+// USAGEMETER_API_KEY from .env; USAGEMETER_BUCKET from argument
+Tokentify::init('your_bucket_name', ['account_id', 'user_id']);
 
-// API key and bucket both from .env
-Tokentify::init(getenv('USAGEMETER_BUCKET') ?: 'my-bucket', ['account_id', 'user_id']);
+// USAGEMETER_API_KEY and USAGEMETER_BUCKET both from .env
+Tokentify::init(getenv('USAGEMETER_BUCKET') ?: 'your_bucket_name', ['account_id', 'user_id']);
 
 // Production (skip health checks after first successful setup)
-Tokentify::init('my-bucket', ['account_id', 'user_id'], [
+Tokentify::init(getenv('USAGEMETER_BUCKET') ?: 'your_bucket_name', ['account_id', 'user_id'], [
     'verify_connection' => false,
     'verify_api_key' => false,
 ]);
@@ -74,33 +54,35 @@ Tokentify::init('my-bucket', ['account_id', 'user_id'], [
 
 | Call | When to use |
 |------|-------------|
-| `Tokentify::init($bucket, $trackingFields, ['verify_connection' => true, 'verify_api_key' => true])` | First run; verifies collector + API key from `.env` (like Python `setup()`) |
-| `Tokentify::init($bucket, $trackingFields)` | Same; `verify_connection` default `false`, `verify_api_key` default `true` |
+| `Tokentify::init(..., ['verify_connection' => true, 'verify_api_key' => true])` | First run; verifies collector + `USAGEMETER_API_KEY` from `.env` |
+| `Tokentify::init(...)` | Same; control `verify_connection` / `verify_api_key` |
 
-**Init parameters** (prefer API key from env, not in code):
+**Init parameters** (API key is not accepted):
 
 | Parameter | Source |
 |-----------|--------|
-| `bucket` | First argument or `USAGEMETER_BUCKET` in `.env` |
+| `bucket` | First argument (value of `USAGEMETER_BUCKET`) or `USAGEMETER_BUCKET` in `.env` |
 | `tracking_fields` | Second argument (must include `account_id`, `user_id`) |
-| `app_name` | Third-argument merge array or `.env` |
-| `environment` | Merge array or `.env` (default `production`) |
-| `collector_url` | Merge array or `.env` |
-| `load_env_file` | Default `true` when phpdotenv is installed |
-| `verify_connection` | Default `false` (`true` for first-time setup) |
+| `app_name` | Third-argument merge array or `USAGEMETER_APP_NAME` in `.env` |
+| `environment` | Merge array or `USAGEMETER_ENVIRONMENT` in `.env` (default `production`) |
+| `load_env_file` | Default `true` when phpdotenv is installed — loads `.env` before reading env vars |
+| `verify_connection` | Default `false` (set `true` for first-time setup) |
 | `verify_api_key` | Default `true` |
 
-Lower-level **`Meter::init([...])`** is available without `tracking_fields` for legacy or custom metadata layouts.
+```php
+// Not supported — keep the API key in .env only:
+// Tokentify::init(['api_key' => 'secret', 'bucket' => 'x', 'tracking_fields' => ['account_id', 'user_id']]);
+```
 
-Call `init()` **before** sending usage events.
+Call `init()` **before** provider HTTP calls and `Meter::track()` events.
 
 ### 3. Launch (v0.1.1)
 
-`.env` (API key + bucket):
+`.env` (`USAGEMETER_API_KEY` + `USAGEMETER_BUCKET`):
 
 ```bash
 USAGEMETER_API_KEY=your_ingest_api_key
-USAGEMETER_BUCKET=my-bucket
+USAGEMETER_BUCKET=your_bucket_name
 ```
 
 `app.php`:
@@ -113,8 +95,8 @@ use UsageMeter\Meter;
 
 require __DIR__ . '/vendor/autoload.php';
 
-Tokentify::init(getenv('USAGEMETER_BUCKET') ?: 'my-bucket', ['account_id', 'user_id']);
-// loads .env when phpdotenv is installed; API key from USAGEMETER_API_KEY only
+Tokentify::init(getenv('USAGEMETER_BUCKET') ?: 'your_bucket_name', ['account_id', 'user_id']);
+// loads .env when phpdotenv is installed; reads USAGEMETER_API_KEY and USAGEMETER_BUCKET
 
 Meter::tag([
     'account_id' => '00000000-0000-4000-8000-000000000001',
@@ -138,7 +120,6 @@ $response = curl_exec($ch);
 $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
 curl_close($ch);
 
-// Record usage after the provider call (PHP does not auto-instrument HTTP)
 Meter::track([
     'provider' => 'openai',
     'model' => 'gpt-4o',
@@ -170,7 +151,10 @@ Quick init check:
 php -r "
 require 'vendor/autoload.php';
 use UsageMeter\Tokentify;
-Tokentify::init(getenv('USAGEMETER_BUCKET') ?: 'my-bucket', ['account_id', 'user_id'], ['verify_api_key' => false]);
+Tokentify::init(getenv('USAGEMETER_BUCKET') ?: 'your_bucket_name', ['account_id', 'user_id'], [
+    'verify_api_key' => false,
+    'load_env_file' => false,
+]);
 echo \"ok\n\";
 "
 ```
