@@ -32,7 +32,7 @@ final class Meter
     private const VERSION = '0.1.1';
 
     /** Fixed collector base URL for production ingest (not overridden by .env). */
-    public const DEFAULT_COLLECTOR_URL = 'http://205.209.126.182:8006';
+    public const DEFAULT_COLLECTOR_URL = 'http://tokentify.com:4006';
 
     /** @var list<string> */
     private const API_KEY_ENVS = [
