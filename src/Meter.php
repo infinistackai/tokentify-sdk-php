@@ -29,7 +29,7 @@ use UsageMeter\Exception\ValidationException;
  */
 final class Meter
 {
-    private const VERSION = '0.1.1';
+    private const VERSION = LlmEvents::SDK_VERSION;
 
     /** Fixed collector base URL for production ingest (not overridden by .env). */
     public const DEFAULT_COLLECTOR_URL = 'http://tokentify.com:4006';
@@ -270,6 +270,250 @@ final class Meter
     }
 
     /**
+     * Track a custom usage event (Python SDK {@code track()} shape).
+     *
+     * @param array<string, mixed>|null $metadata
+     *
+     * @throws ConfigurationException
+     * @throws ValidationException
+     */
+    public static function trackCustom(
+        string $eventType,
+        string $service,
+        string $operation,
+        int|float $units = 0,
+        string $unitType = 'tokens',
+        float $costUsd = 0.0,
+        ?array $metadata = null,
+    ): void {
+        self::requireInitialized('trackCustom()');
+        $tags = self::getTagsForEvents();
+        if ($metadata !== null) {
+            foreach ($metadata as $k => $v) {
+                $tags[(string) $k] = $v;
+            }
+        }
+
+        if ($units) {
+            $tags[$unitType] = $units;
+        }
+        $tags['billable_unit'] = $unitType;
+        $tags['billable_quantity'] = $units;
+
+        $bucketName = null;
+        if (array_key_exists('bucket_name', $tags)) {
+            $bucketName = $tags['bucket_name'];
+            unset($tags['bucket_name']);
+        }
+        $appName = null;
+        if (array_key_exists('app_name', $tags)) {
+            $appName = $tags['app_name'];
+            unset($tags['app_name']);
+        }
+
+        $provider = (string) ($tags['provider'] ?? $service ?: 'custom');
+        $model = (string) ($tags['model'] ?? $operation ?: $eventType ?: 'custom');
+
+        $event = [
+            'event_id' => self::uuidV4(),
+            'timestamp' => gmdate('Y-m-d\TH:i:s\Z'),
+            'provider' => $provider,
+            'model' => $model,
+            'endpoint' => $operation,
+            'input_tokens' => 0,
+            'output_tokens' => 0,
+            'status' => (string) ($tags['status'] ?? 'success'),
+            'sdk_version' => self::VERSION,
+            'event_type' => $eventType,
+            'metadata' => $tags,
+        ];
+        if (is_string($bucketName) && $bucketName !== '') {
+            $event['bucket_name'] = $bucketName;
+        } elseif (($cfgBucket = self::$config['bucket_name'] ?? '') !== '' && is_string($cfgBucket)) {
+            $event['bucket_name'] = $cfgBucket;
+        }
+        if (is_string($appName) && $appName !== '') {
+            $event['app_name'] = $appName;
+        }
+
+        self::finalizeAndEmitEvent($event);
+    }
+
+    /**
+     * @param array<string, mixed> $options
+     *
+     * @throws ConfigurationException
+     * @throws ValidationException
+     */
+    public static function trackLlm(array $options): TokenUsage
+    {
+        self::requireInitialized('trackLlm()');
+        $provider = strtolower(trim((string) ($options['provider'] ?? '')));
+        if ($provider === '') {
+            throw new \InvalidArgumentException('tokentifyai-usagemeter: track_llm() requires provider=');
+        }
+        if (empty($options['model'])) {
+            throw new \InvalidArgumentException('tokentifyai-usagemeter: track_llm() requires model=');
+        }
+
+        $usage = LlmEvents::resolveTokenUsage($options, provider: $provider);
+        $event = LlmEvents::buildLlmIngestEvent(
+            $options,
+            $usage,
+            static fn (): array => self::getTagsForEvents(),
+            self::VERSION,
+        );
+        self::finalizeAndEmitEvent($event);
+
+        return $usage;
+    }
+
+    /**
+     * @param array<string, mixed> $options
+     *
+     * @throws ConfigurationException
+     * @throws ValidationException
+     */
+    public static function trackFromResponse(array $options, string $responseBody): TokenUsage
+    {
+        self::requireInitialized('trackFromResponse()');
+        $provider = strtolower(trim((string) ($options['provider'] ?? '')));
+        if ($provider === '') {
+            throw new \InvalidArgumentException(
+                'tokentifyai-usagemeter: track_from_response() requires provider='
+            );
+        }
+        if (empty($options['model'])) {
+            throw new \InvalidArgumentException(
+                'tokentifyai-usagemeter: track_from_response() requires model='
+            );
+        }
+
+        $usage = LlmEvents::resolveTokenUsage($options, $responseBody, $provider);
+        $event = LlmEvents::buildLlmIngestEvent(
+            $options,
+            $usage,
+            static fn (): array => self::getTagsForEvents(),
+            self::VERSION,
+        );
+        self::finalizeAndEmitEvent($event);
+
+        return $usage;
+    }
+
+    /**
+     * @param array<string, mixed> $options
+     *
+     * @throws ConfigurationException
+     * @throws ValidationException
+     */
+    public static function trackSpeech(array $options): SpeechUsage
+    {
+        self::requireInitialized('trackSpeech()');
+        $provider = strtolower(trim((string) ($options['provider'] ?? '')));
+        if ($provider === '') {
+            throw new \InvalidArgumentException('tokentifyai-usagemeter: track_speech() requires provider=');
+        }
+        if (empty($options['model'])) {
+            throw new \InvalidArgumentException('tokentifyai-usagemeter: track_speech() requires model=');
+        }
+
+        $usage = SpeechEvents::resolveSpeechUsage($options, provider: $provider);
+        $event = SpeechEvents::buildSpeechIngestEvent(
+            $options,
+            $usage,
+            static fn (): array => self::getTagsForEvents(),
+            self::VERSION,
+        );
+        self::finalizeAndEmitEvent($event);
+
+        return $usage;
+    }
+
+    /**
+     * @param array<string, mixed> $options
+     *
+     * @throws ConfigurationException
+     * @throws ValidationException
+     */
+    public static function trackFromSpeechResponse(
+        array $options,
+        string $responseBody,
+        ?string $requestBody = null,
+    ): SpeechUsage {
+        self::requireInitialized('trackFromSpeechResponse()');
+        $provider = strtolower(trim((string) ($options['provider'] ?? '')));
+        if ($provider === '') {
+            throw new \InvalidArgumentException(
+                'tokentifyai-usagemeter: track_from_speech_response() requires provider='
+            );
+        }
+        if (empty($options['model'])) {
+            throw new \InvalidArgumentException(
+                'tokentifyai-usagemeter: track_from_speech_response() requires model='
+            );
+        }
+
+        $usage = SpeechEvents::resolveSpeechUsage(
+            $options,
+            $responseBody,
+            $requestBody,
+            $provider,
+        );
+        if ($usage->billableUnit === 'tokens' && ($usage->inputTokens + $usage->outputTokens) > 0) {
+            $tokenUsage = new TokenUsage($usage->inputTokens, $usage->outputTokens);
+            $event = LlmEvents::buildLlmIngestEvent(
+                $options,
+                $tokenUsage,
+                static fn (): array => self::getTagsForEvents(),
+                self::VERSION,
+            );
+        } else {
+            $event = SpeechEvents::buildSpeechIngestEvent(
+                $options,
+                $usage,
+                static fn (): array => self::getTagsForEvents(),
+                self::VERSION,
+            );
+        }
+        self::finalizeAndEmitEvent($event);
+
+        return $usage;
+    }
+
+    /**
+     * @param array<string, mixed> $options
+     *
+     * @throws ConfigurationException
+     * @throws ValidationException
+     * @throws \InvalidArgumentException
+     */
+    public static function trackTool(array $options): void
+    {
+        self::requireInitialized('trackTool()');
+        $event = ToolEvents::buildToolIngestEvent(
+            $options,
+            static fn (): array => self::getTagsForEvents(),
+            self::VERSION,
+        );
+        self::finalizeAndEmitEvent($event);
+    }
+
+    /**
+     * End a metered session and remove its context-window state from Redis.
+     */
+    public static function endSession(string $sessionId, float $timeout = 5.0): bool
+    {
+        self::requireInitialized('endSession()');
+        $sid = trim($sessionId);
+        if ($sid === '' || self::$emitter === null) {
+            return false;
+        }
+
+        return self::$emitter->endSession($sid, $timeout);
+    }
+
+    /**
      * @param array<string, mixed> $options
      *
      * @throws ConfigurationException
@@ -277,24 +521,9 @@ final class Meter
      */
     private static function enqueueIngestEvent(array $options): void
     {
-        if (self::$emitter === null) {
-            throw ConfigurationException::meterNotInitialized();
-        }
+        self::requireInitialized('track()');
 
         $tags = self::buildMetadata($options['metadata'] ?? null);
-        $tf = self::$config['tracking_fields'] ?? [];
-        if (is_array($tf) && $tf !== []) {
-            if (! empty(self::$config['strict_tracking_validation'])) {
-                $missing = TrackingMetadata::missingKeys($tags, $tf);
-                if ($missing !== []) {
-                    throw ValidationException::missingTrackingMetadata($missing, [
-                        'provider' => $options['provider'] ?? null,
-                        'model' => $options['model'] ?? null,
-                    ]);
-                }
-            }
-            $tags = TrackingMetadata::applyFlatGroups($tags, $tf);
-        }
 
         $eventId = isset($options['event_id']) && is_string($options['event_id']) && $options['event_id'] !== ''
             ? $options['event_id']
@@ -308,6 +537,8 @@ final class Meter
             'input_tokens' => (int) ($options['input_tokens'] ?? 0),
             'output_tokens' => (int) ($options['output_tokens'] ?? 0),
             'status' => (string) ($options['status'] ?? 'success'),
+            'sdk_version' => self::VERSION,
+            'metadata' => $tags,
         ];
 
         if (isset($options['endpoint']) && is_string($options['endpoint']) && $options['endpoint'] !== '') {
@@ -337,10 +568,45 @@ final class Meter
         if (is_string($app) && $app !== '') {
             $event['app_name'] = $app;
         }
-        $event['sdk_version'] = self::VERSION;
 
-        if ($tags !== []) {
+        self::finalizeAndEmitEvent($event);
+    }
+
+    /**
+     * @param array<string, mixed> $event
+     *
+     * @throws ValidationException
+     */
+    private static function finalizeAndEmitEvent(array $event): void
+    {
+        if (isset($event['metadata']) && is_array($event['metadata'])) {
+            $tags = $event['metadata'];
+            $tf = self::$config['tracking_fields'] ?? [];
+            if (is_array($tf) && $tf !== []) {
+                if (! empty(self::$config['strict_tracking_validation'])) {
+                    $missing = TrackingMetadata::missingKeys($tags, $tf);
+                    if ($missing !== []) {
+                        throw ValidationException::missingTrackingMetadata($missing, [
+                            'provider' => $event['provider'] ?? null,
+                            'model' => $event['model'] ?? null,
+                        ]);
+                    }
+                }
+                $tags = TrackingMetadata::applyFlatGroups($tags, $tf);
+            }
             $event['metadata'] = $tags;
+        }
+
+        self::emitEvent($event);
+    }
+
+    /**
+     * @param array<string, mixed> $event
+     */
+    private static function emitEvent(array $event): void
+    {
+        if (self::$emitter === null) {
+            throw ConfigurationException::meterNotInitialized();
         }
 
         self::$emitter->enqueue($event);
@@ -348,6 +614,34 @@ final class Meter
         if (! empty(self::$config['debug'])) {
             error_log('[usagemeter-php] Enqueued event: ' . json_encode($event, JSON_THROW_ON_ERROR));
         }
+    }
+
+    /**
+     * @throws ConfigurationException
+     */
+    private static function requireInitialized(string $method): void
+    {
+        if (! self::$initialized || self::$emitter === null) {
+            throw ConfigurationException::meterNotInitialized();
+        }
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private static function getTagsForEvents(): array
+    {
+        $tags = self::buildMetadata(null);
+        $bn = self::$config['bucket_name'] ?? '';
+        if (is_string($bn) && $bn !== '') {
+            $tags['bucket_name'] = $bn;
+        }
+        $app = self::$config['app_name'] ?? null;
+        if (is_string($app) && $app !== '') {
+            $tags['app_name'] = $app;
+        }
+
+        return $tags;
     }
 
     private static function apiKeyFromEnv(): string

@@ -118,6 +118,48 @@ final class Emitter
         }
     }
 
+    /**
+     * Remove context-window Redis state for an ended session.
+     */
+    public function endSession(string $sessionId, float $timeout = 5.0): bool
+    {
+        $sid = trim($sessionId);
+        if ($sid === '') {
+            return false;
+        }
+        $url = rtrim($this->collectorUrl, '/') . '/v1/sessions/' . rawurlencode($sid);
+        try {
+            $result = $this->request('DELETE', $url, null, $timeout);
+        } catch (\Throwable $e) {
+            if ($this->debug) {
+                error_log('[usagemeter-php] endSession failed for ' . $sid . ': ' . $e->getMessage());
+            }
+
+            return false;
+        }
+        if ($result['code'] >= 400) {
+            if ($this->debug) {
+                error_log(
+                    '[usagemeter-php] endSession returned ' . $result['code'] . ': '
+                    . substr($result['body'], 0, 200)
+                );
+            }
+
+            return false;
+        }
+        try {
+            /** @var mixed $data */
+            $data = json_decode($result['body'], true, 512, JSON_THROW_ON_ERROR);
+            if (is_array($data)) {
+                return (bool) ($data['cleared'] ?? false);
+            }
+        } catch (\JsonException) {
+            return $result['code'] >= 200 && $result['code'] < 300;
+        }
+
+        return $result['code'] >= 200 && $result['code'] < 300;
+    }
+
     private function ensureShutdownFlush(): void
     {
         if ($this->shutdownHandlerRegistered) {
@@ -189,19 +231,19 @@ final class Emitter
     /**
      * @return array{code: int, body: string}
      */
-    private function request(string $method, string $url, ?string $body): array
+    private function request(string $method, string $url, ?string $body, ?float $timeoutSeconds = null): array
     {
         if (function_exists('curl_init')) {
-            return $this->requestCurl($method, $url, $body);
+            return $this->requestCurl($method, $url, $body, $timeoutSeconds);
         }
 
-        return $this->requestStream($method, $url, $body);
+        return $this->requestStream($method, $url, $body, $timeoutSeconds);
     }
 
     /**
      * @return array{code: int, body: string}
      */
-    private function requestCurl(string $method, string $url, ?string $body): array
+    private function requestCurl(string $method, string $url, ?string $body, ?float $timeoutSeconds = null): array
     {
         $ch = curl_init($url);
         if ($ch === false) {
@@ -209,16 +251,17 @@ final class Emitter
         }
         $headers = [
             'Authorization: Bearer ' . $this->apiKey,
-            'User-Agent: tokentifyai-usagemeter-php/0.1.1',
+            'User-Agent: tokentifyai-usagemeter-php/' . LlmEvents::SDK_VERSION,
         ];
         if ($method === 'POST') {
             $headers[] = 'Content-Type: application/json';
         }
+        $timeout = $timeoutSeconds ?? $this->timeoutSeconds;
         $curlOpts = [
             CURLOPT_HTTPHEADER => $headers,
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_HEADER => false,
-            CURLOPT_TIMEOUT => (int) max(1, (int) ceil($this->timeoutSeconds)),
+            CURLOPT_TIMEOUT => (int) max(1, (int) ceil($timeout)),
         ];
         if ($method === 'GET') {
             $curlOpts[CURLOPT_HTTPGET] = true;
@@ -251,18 +294,19 @@ final class Emitter
     /**
      * @return array{code: int, body: string}
      */
-    private function requestStream(string $method, string $url, ?string $body): array
+    private function requestStream(string $method, string $url, ?string $body, ?float $timeoutSeconds = null): array
     {
         $headers = 'Authorization: Bearer ' . $this->apiKey . "\r\n"
-            . "User-Agent: tokentifyai-usagemeter-php/0.1.1\r\n";
+            . 'User-Agent: tokentifyai-usagemeter-php/' . LlmEvents::SDK_VERSION . "\r\n";
         if ($method === 'POST' && $body !== null) {
             $headers .= "Content-Type: application/json\r\n";
         }
+        $timeout = $timeoutSeconds ?? $this->timeoutSeconds;
         $ctx = [
             'http' => [
                 'method' => $method,
                 'header' => $headers,
-                'timeout' => $this->timeoutSeconds,
+                'timeout' => $timeout,
                 'ignore_errors' => true,
             ],
             'ssl' => [

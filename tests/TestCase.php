@@ -6,6 +6,7 @@ namespace UsageMeter\Test;
 
 use PHPUnit\Framework\TestCase as PHPUnitTestCase;
 use ReflectionClass;
+use UsageMeter\Emitter;
 use UsageMeter\Meter;
 
 /**
@@ -82,5 +83,37 @@ abstract class TestCase extends PHPUnitTestCase
         $p->setAccessible(true);
         /** @var array<string, mixed> */
         return (array) $p->getValue();
+    }
+
+    protected static function initMeterForTests(array $extra = []): void
+    {
+        self::resetMeterStatics();
+        Meter::init(array_merge([
+            'api_key' => 'unit-test',
+            'bucket' => 'test-bucket',
+            'verify_api_key' => false,
+            'verify_connection' => false,
+            'load_env_file' => false,
+            'auto_flush_on_batch' => false,
+        ], $extra));
+    }
+
+    /**
+     * @return list<array<string, mixed>>
+     */
+    protected static function queuedEvents(): array
+    {
+        $ref = new ReflectionClass(Meter::class);
+        $p = $ref->getProperty('emitter');
+        $p->setAccessible(true);
+        $emitter = $p->getValue();
+        if (! $emitter instanceof Emitter) {
+            return [];
+        }
+        $queueRef = new ReflectionClass(Emitter::class);
+        $q = $queueRef->getProperty('queue');
+        $q->setAccessible(true);
+        /** @var list<array<string, mixed>> */
+        return (array) $q->getValue($emitter);
     }
 }
