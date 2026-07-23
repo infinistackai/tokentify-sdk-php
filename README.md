@@ -76,7 +76,59 @@ Tokentify::init(getenv('USAGEMETER_BUCKET') ?: 'your_bucket_name', ['account_id'
 
 Call `init()` **before** provider HTTP calls and `Meter::track()` events.
 
-### 3. Launch (v0.1.1)
+## Token breakdown (v0.4.0)
+
+The SDK extracts **input**, **output**, **cache read**, and **cache write** tokens from provider JSON via `UsageParser`.
+
+### Recommended — `trackFromResponse`
+
+```php
+$response = curl_exec($ch);
+$status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+
+$usage = Meter::trackFromResponse(
+    [
+        'provider' => 'openai',
+        'model' => 'gpt-4o',
+        'http_status' => $status,
+        'status' => $status >= 200 && $status < 300 ? 'success' : 'error',
+    ],
+    is_string($response) ? $response : '',
+);
+```
+
+### Alternative — `track(['response_body' => ...])`
+
+```php
+Meter::track([
+    'provider' => 'openai',
+    'model' => 'gpt-4o',
+    'response_body' => $response,
+]);
+```
+
+### Field mapping
+
+| Ingest field | Anthropic source | OpenAI source |
+|--------------|------------------|---------------|
+| `input_tokens` | `usage.input_tokens` | `prompt_tokens − cached_tokens` |
+| `output_tokens` | `usage.output_tokens` | `usage.completion_tokens` |
+| `cache_read_tokens` | `usage.cache_read_input_tokens` | `usage.prompt_tokens_details.cached_tokens` |
+| `cache_write_tokens` | `usage.cache_creation_input_tokens` | — |
+
+### Anti-pattern
+
+```php
+// ❌ drops cache_read_tokens
+Meter::track([
+    'provider' => 'openai',
+    'model' => 'gpt-4o',
+    'input_tokens' => $usage['prompt_tokens'],
+    'output_tokens' => $usage['completion_tokens'],
+]);
+```
+
+### 3. Launch (v0.4.0)
 
 `.env` (`USAGEMETER_API_KEY` + `USAGEMETER_BUCKET`):
 
@@ -120,14 +172,15 @@ $response = curl_exec($ch);
 $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
 curl_close($ch);
 
-Meter::track([
-    'provider' => 'openai',
-    'model' => 'gpt-4o',
-    'input_tokens' => 10,
-    'output_tokens' => 5,
-    'http_status' => $status,
-    'status' => $status >= 200 && $status < 300 ? 'success' : 'error',
-]);
+Meter::trackFromResponse(
+    [
+        'provider' => 'openai',
+        'model' => 'gpt-4o',
+        'http_status' => $status,
+        'status' => $status >= 200 && $status < 300 ? 'success' : 'error',
+    ],
+    is_string($response) ? $response : '',
+);
 
 Meter::flush();
 ```

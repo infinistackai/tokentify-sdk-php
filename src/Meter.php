@@ -247,7 +247,41 @@ final class Meter
         if ($provider === '' || $model === '') {
             throw ValidationException::missingProviderOrModel();
         }
+
+        if (array_key_exists('response_body', $options) && $options['response_body'] !== null) {
+            $responseBody = $options['response_body'];
+            unset($options['response_body']);
+            if (! is_string($responseBody)) {
+                $responseBody = (string) $responseBody;
+            }
+            self::trackFromResponse($options, $responseBody);
+
+            return;
+        }
+
+        if (self::hasLlmAliasKeys($options)) {
+            self::trackLlm($options);
+
+            return;
+        }
+
         self::enqueueIngestEvent($options);
+    }
+
+    /**
+     * @param array<string, mixed> $options
+     */
+    private static function hasLlmAliasKeys(array $options): bool
+    {
+        foreach (
+            ['prompt_tokens', 'completion_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens'] as $key
+        ) {
+            if (array_key_exists($key, $options) && $options[$key] !== null) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
