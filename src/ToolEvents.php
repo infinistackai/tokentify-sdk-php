@@ -45,7 +45,7 @@ final class ToolEvents
         string $sdkVersion = LlmEvents::SDK_VERSION,
     ): array {
         $traceId = self::requireNonEmptyString($options['trace_id'] ?? null, 'trace_id');
-        $spanId = self::requireNonEmptyString($options['span_id'] ?? null, 'span_id');
+        $spanId = self::resolveSpanId($options['span_id'] ?? null);
         $toolName = self::requireNonEmptyString($options['tool_name'] ?? null, 'tool_name');
         $status = self::normalizeStatus($options['status'] ?? null);
         $durationMs = self::normalizeDurationMs($options['duration_ms'] ?? null);
@@ -148,6 +148,19 @@ final class ToolEvents
         }
 
         return $event;
+    }
+
+    private static function resolveSpanId(mixed $value): string
+    {
+        if ($value === null || (is_string($value) && trim($value) === '')) {
+            return self::uuidV4();
+        }
+        $text = trim((string) $value);
+        if ($text === '') {
+            return self::uuidV4();
+        }
+
+        return $text;
     }
 
     private static function requireNonEmptyString(mixed $value, string $field): string

@@ -9,7 +9,7 @@ namespace UsageMeter;
  */
 final class LlmEvents
 {
-    public const SDK_VERSION = '0.4.0';
+    public const SDK_VERSION = '0.4.1';
 
     /**
      * @param array<string, mixed> $options

@@ -81,6 +81,21 @@ final class TrackToolTest extends TestCase
         $this->assertArrayNotHasKey('latency_ms', $event);
     }
 
+    public function testBuildToolIngestEventAutoGeneratesSpanId(): void
+    {
+        $event = ToolEvents::buildToolIngestEvent(
+            [
+                'trace_id' => 'tr_abc',
+                'tool_name' => 'lookup',
+                'status' => 'success',
+            ],
+            static fn (): array => [],
+        );
+        $spanId = $event['metadata']['span_id'];
+        $this->assertIsString($spanId);
+        $this->assertNotSame('', trim($spanId));
+    }
+
     /**
      * @return list<string>
      */
@@ -88,7 +103,6 @@ final class TrackToolTest extends TestCase
     {
         return [
             ['trace_id'],
-            ['span_id'],
             ['tool_name'],
             ['status'],
         ];
