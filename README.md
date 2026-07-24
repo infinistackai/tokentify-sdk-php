@@ -76,6 +76,28 @@ Tokentify::init(getenv('USAGEMETER_BUCKET') ?: 'your_bucket_name', ['account_id'
 
 Call `init()` **before** provider HTTP calls and `Meter::track()` events.
 
+## Agent tool tracking
+
+After your app executes a tool (any provider / agent framework), call
+`Meter::trackTool()` once:
+
+```php
+Meter::trackTool([
+    'trace_id' => 'tr_abc',
+    'span_id' => 'sp_1',
+    'tool_name' => 'get_weather',
+    'tool_input' => ['city' => 'Paris'],
+    'tool_output' => ['temp_c' => 22],
+    'status' => 'success',
+    'duration_ms' => 42,
+]);
+```
+
+Provider APIs expose tool-call data in different places (response content vs
+client-side MCP loops; never in billing `usage`). See the
+[provider research matrix](https://github.com/infinistackai/tokentify-backend/blob/main/docs/AfterDemo/04-tool-usage-tracking.md#provider-research--where-tool-call-data-lives)
+before adding auto-capture.
+
 ## Token breakdown (v0.4.0)
 
 The SDK extracts **input**, **output**, **cache read**, and **cache write** tokens from provider JSON via `UsageParser`.
