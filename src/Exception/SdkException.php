@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace UsageMeter\Exception;
+namespace Tokentify\Exception;
 
 /**
  * Base exception for the PHP SDK (configuration, validation, transport).

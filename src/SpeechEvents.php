@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace UsageMeter;
+namespace Tokentify;
 
 /**
  * Build and resolve speech usage events for ingest.
@@ -77,6 +77,7 @@ final class SpeechEvents
         foreach ($metadata as $k => $v) {
             $tags[(string) $k] = $v;
         }
+        Attribution::applyCallAttribution($tags, $options);
         foreach ($usage->toMetadata() as $k => $v) {
             $tags[(string) $k] = $v;
         }
@@ -107,16 +108,16 @@ final class SpeechEvents
 
         $eventId = isset($options['event_id']) && is_string($options['event_id']) && $options['event_id'] !== ''
             ? $options['event_id']
-            : self::uuidV4();
+            : LlmEvents::uuidV4();
 
         $event = [
             'event_id' => $eventId,
             'timestamp' => $tsStr,
             'provider' => UsageParser::normalizeProvider((string) ($options['provider'] ?? '')),
-            'model' => (string) ($options['model'] ?? 'unknown'),
+            'model' => (string) (($options['model'] ?? '') ?: 'unknown'),
             'input_tokens' => $usage->inputTokens,
             'output_tokens' => $usage->outputTokens,
-            'status' => (string) ($options['status'] ?? 'success'),
+            'status' => (string) (($options['status'] ?? '') ?: 'success'),
             'sdk_version' => $sdkVersion,
             'metadata' => $tags !== [] ? $tags : [],
             'bucket_name' => $bucketName,
@@ -148,12 +149,4 @@ final class SpeechEvents
         return $event;
     }
 
-    private static function uuidV4(): string
-    {
-        $b = random_bytes(16);
-        $b[6] = chr((ord($b[6]) & 0x0f) | 0x40);
-        $b[8] = chr((ord($b[8]) & 0x3f) | 0x80);
-
-        return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($b), 4));
-    }
 }

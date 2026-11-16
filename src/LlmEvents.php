@@ -2,16 +2,18 @@
 
 declare(strict_types=1);
 
-namespace UsageMeter;
+namespace Tokentify;
 
 /**
  * Build and resolve LLM usage events for ingest.
  */
 final class LlmEvents
 {
-    public const SDK_VERSION = '0.4.1';
+    public const SDK_VERSION = '0.5.0';
 
     /**
+     * Merge explicit counts, alias keys, and parsed response usage.
+     *
      * @param array<string, mixed> $options
      */
     public static function resolveTokenUsage(
@@ -24,10 +26,10 @@ final class LlmEvents
             $parsed = UsageParser::fromProviderResponse($responseBody, $provider);
         }
 
-        $pick = static function (array $opts, array $keys, int $fallback): int {
+        $pick = static function (array $keys, int $fallback) use ($options): int {
             foreach ($keys as $key) {
-                if (array_key_exists($key, $opts) && $opts[$key] !== null) {
-                    return (int) $opts[$key];
+                if (array_key_exists($key, $options) && $options[$key] !== null) {
+                    return (int) $options[$key];
                 }
             }
 
@@ -36,16 +38,40 @@ final class LlmEvents
 
         $providerKey = UsageParser::normalizeProvider($provider ?? (string) ($options['provider'] ?? ''));
         $usage = new TokenUsage(
-            $pick($options, ['input_tokens', 'prompt_tokens'], $parsed->inputTokens),
-            $pick($options, ['output_tokens', 'completion_tokens'], $parsed->outputTokens),
-            $pick($options, ['cache_read_tokens', 'cache_read_input_tokens'], $parsed->cacheReadTokens),
-            $pick($options, ['cache_write_tokens', 'cache_creation_input_tokens'], $parsed->cacheWriteTokens),
+            $pick(['input_tokens', 'prompt_tokens'], $parsed->inputTokens),
+            $pick(['output_tokens', 'completion_tokens'], $parsed->outputTokens),
+            $pick(['cache_read_tokens', 'cache_read_input_tokens'], $parsed->cacheReadTokens),
+            $pick(['cache_write_tokens', 'cache_creation_input_tokens'], $parsed->cacheWriteTokens),
         );
+
+        // TokenUsage holds input_tokens WITHOUT the cached part. Parsed responses already come that way;
+        // an explicit OpenAI-family input_tokens / prompt_tokens is the provider's raw count (cached included),
+        // so only that one is reduced here.
+        $explicitInput = ($options['input_tokens'] ?? null) !== null || ($options['prompt_tokens'] ?? null) !== null;
+        if (! $explicitInput) {
+            return $usage;
+        }
 
         return UsageParser::normalizeOpenaiFamilyUsage($usage, $providerKey);
     }
 
     /**
+     * `input_tokens` as the collector expects it, the same as the gateway sends it: OpenAI-family counts
+     * include the cached tokens (the provider's raw `prompt_tokens`); the collector removes them once when
+     * pricing. Other providers (Anthropic, Google, ...) report input without the cache, unchanged.
+     */
+    public static function wireInputTokens(TokenUsage $usage, string $provider): int
+    {
+        if (UsageParser::isOpenaiFamily($provider)) {
+            return $usage->inputTokens + $usage->cacheReadTokens;
+        }
+
+        return $usage->inputTokens;
+    }
+
+    /**
+     * Build a collector ingest event from resolved usage.
+     *
      * @param array<string, mixed> $options
      * @param callable(): array<string, mixed> $getTagsFn
      * @return array<string, mixed>
@@ -57,17 +83,20 @@ final class LlmEvents
         string $sdkVersion = self::SDK_VERSION,
     ): array {
         $tags = $getTagsFn();
-        $metadata = is_array($options['metadata'] ?? null) ? $options['metadata'] : [];
-        foreach ($metadata as $k => $v) {
+        foreach ((is_array($options['metadata'] ?? null) ? $options['metadata'] : []) as $k => $v) {
             $tags[(string) $k] = $v;
         }
+        Attribution::applyCallAttribution($tags, $options);
 
-        $tags['input_tokens'] = $usage->inputTokens;
+        $inputTokens = self::wireInputTokens($usage, (string) ($options['provider'] ?? ''));
+
+        // Mirror token counts into metadata for custom-metrics field discovery (same values as the gateway).
+        $tags['input_tokens'] = $inputTokens;
         $tags['output_tokens'] = $usage->outputTokens;
-        $tags['total_tokens'] = $usage->inputTokens + $usage->outputTokens;
+        $tags['total_tokens'] = $inputTokens + $usage->outputTokens;
         $tags['cache_read_tokens'] = $usage->cacheReadTokens;
         $tags['cache_write_tokens'] = $usage->cacheWriteTokens;
-        if (array_key_exists('endpoint', $options) && $options['endpoint'] !== null) {
+        if (($options['endpoint'] ?? null) !== null) {
             $tags['endpoint'] = $options['endpoint'];
         }
         $provider = UsageParser::normalizeProvider((string) ($options['provider'] ?? ''));
@@ -75,67 +104,88 @@ final class LlmEvents
             $tags['provider'] = $provider;
         }
 
-        $bucketName = null;
-        if (array_key_exists('bucket_name', $tags)) {
-            $bucketName = $tags['bucket_name'];
-            unset($tags['bucket_name']);
-        }
-        $appName = null;
-        if (array_key_exists('app_name', $tags)) {
-            $appName = $tags['app_name'];
-            unset($tags['app_name']);
-        }
-
-        $timestamp = $options['timestamp'] ?? null;
-        if (is_int($timestamp) || is_float($timestamp)) {
-            $tsStr = gmdate('Y-m-d\TH:i:s\Z', (int) $timestamp);
-        } elseif (is_string($timestamp) && $timestamp !== '') {
-            $tsStr = $timestamp;
-        } else {
-            $tsStr = gmdate('Y-m-d\TH:i:s\Z');
-        }
-
-        $eventId = isset($options['event_id']) && is_string($options['event_id']) && $options['event_id'] !== ''
-            ? $options['event_id']
-            : self::uuidV4();
+        $bucketName = self::pull($tags, 'bucket_name');
+        $bucketSlug = self::pull($tags, 'bucket_slug') ?? ($options['bucket_slug'] ?? null);
+        $appName = self::pull($tags, 'app_name');
 
         $event = [
-            'event_id' => $eventId,
-            'timestamp' => $tsStr,
+            'event_id' => self::eventId($options),
+            'timestamp' => self::formatTimestamp($options['timestamp'] ?? null),
             'provider' => $provider,
-            'model' => (string) ($options['model'] ?? 'unknown'),
-            'input_tokens' => $usage->inputTokens,
+            'model' => (string) (($options['model'] ?? '') ?: 'unknown'),
+            'input_tokens' => $inputTokens,
             'output_tokens' => $usage->outputTokens,
             'cache_read_tokens' => $usage->cacheReadTokens,
             'cache_write_tokens' => $usage->cacheWriteTokens,
-            'status' => (string) ($options['status'] ?? 'success'),
+            'status' => (string) (($options['status'] ?? '') ?: 'success'),
             'sdk_version' => $sdkVersion,
-            'metadata' => $tags !== [] ? $tags : [],
+            'metadata' => $tags,
         ];
 
-        if (array_key_exists('endpoint', $options) && $options['endpoint'] !== null) {
+        if (($options['endpoint'] ?? null) !== null) {
             $event['endpoint'] = $options['endpoint'];
         }
-        if (array_key_exists('latency_ms', $options) && $options['latency_ms'] !== null) {
+        if (($options['latency_ms'] ?? null) !== null) {
             $event['latency_ms'] = (int) $options['latency_ms'];
         }
-        if (array_key_exists('http_status', $options) && $options['http_status'] !== null) {
+        if (($options['http_status'] ?? null) !== null) {
             $event['http_status'] = (int) $options['http_status'];
         }
-        if (array_key_exists('error_code', $options) && $options['error_code'] !== null) {
+        if (($options['error_code'] ?? null) !== null) {
             $event['error_code'] = $options['error_code'];
         }
-        if (is_string($appName) && $appName !== '') {
-            $event['app_name'] = $appName;
+        if ($appName !== null && $appName !== '') {
+            $event['app_name'] = (string) $appName;
         }
-        if (is_string($bucketName) && $bucketName !== '') {
-            $event['bucket_name'] = $bucketName;
+        if ($bucketName !== null && $bucketName !== '') {
+            $event['bucket_name'] = (string) $bucketName;
+        }
+        if ($bucketSlug !== null && $bucketSlug !== '') {
+            $event['bucket_slug'] = (string) $bucketSlug;
         }
 
         return $event;
     }
 
-    private static function uuidV4(): string
+    /**
+     * Remove and return $tags[$key] (Python's dict.pop(key, None)).
+     *
+     * @param array<string, mixed> $tags
+     */
+    public static function pull(array &$tags, string $key): mixed
+    {
+        if (! array_key_exists($key, $tags)) {
+            return null;
+        }
+        $value = $tags[$key];
+        unset($tags[$key]);
+
+        return $value;
+    }
+
+    public static function formatTimestamp(mixed $timestamp): string
+    {
+        if (is_int($timestamp) || is_float($timestamp)) {
+            return gmdate('Y-m-d\TH:i:s\Z', (int) $timestamp);
+        }
+        if (is_string($timestamp) && trim($timestamp) !== '') {
+            return trim($timestamp);
+        }
+
+        return gmdate('Y-m-d\TH:i:s\Z');
+    }
+
+    /**
+     * @param array<string, mixed> $options
+     */
+    public static function eventId(array $options): string
+    {
+        $given = $options['event_id'] ?? null;
+
+        return is_scalar($given) && (string) $given !== '' ? (string) $given : self::uuidV4();
+    }
+
+    public static function uuidV4(): string
     {
         $b = random_bytes(16);
         $b[6] = chr((ord($b[6]) & 0x0f) | 0x40);

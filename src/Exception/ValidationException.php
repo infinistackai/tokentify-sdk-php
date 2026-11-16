@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace UsageMeter\Exception;
+namespace Tokentify\Exception;
 
 /**
  * Thrown when strict Tokentify-style metadata validation fails (missing tracking keys)
@@ -13,7 +13,7 @@ final class ValidationException extends SdkException
     public static function missingProviderOrModel(): self
     {
         return new self(
-            'UsageMeter::track() requires non-empty provider and model keys in the options array.',
+            'tokentify: track() requires non-empty provider and model keys in the options array.',
             0,
             null,
             ['sdk_error' => 'invalid_track_options'],
@@ -29,8 +29,8 @@ final class ValidationException extends SdkException
         $keys = implode(', ', $missingKeys);
 
         return new self(
-            'UsageMeter: strict_tracking_validation is enabled but metadata is missing required keys: ' . $keys
-            . '. Pass them via Meter::tag(), track(..., metadata: [...]), or trackSms(..., metadata: [...]).',
+            'tokentify: strict_tracking_validation is enabled but metadata is missing required keys: ' . $keys
+            . '. Pass them via Tokentify::tag() or the event metadata.',
             0,
             null,
             array_merge([

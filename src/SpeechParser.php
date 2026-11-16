@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace UsageMeter;
+namespace Tokentify;
 
 /**
  * Extract speech usage from provider request/response bodies.
@@ -142,6 +142,25 @@ final class SpeechParser
     public static function apiRequestUsage(string $kind): SpeechUsage
     {
         return new SpeechUsage($kind, 'request', 1.0);
+    }
+
+    /**
+     * Resolve speech usage for an intercepted HTTP call (Guzzle middleware / PSR-18 client).
+     */
+    public static function fromTransport(
+        string $endpoint,
+        string $provider,
+        ?string $responseBody = null,
+        ?string $requestBody = null,
+    ): ?SpeechUsage {
+        if (self::isSttEndpoint($endpoint) && $responseBody !== null) {
+            return self::parseSttDuration($responseBody, $provider);
+        }
+        if (self::isTtsEndpoint($endpoint)) {
+            return self::parseTtsCharacters($requestBody, $provider);
+        }
+
+        return null;
     }
 
     /**

@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace UsageMeter\Exception;
+namespace Tokentify\Exception;
 
 /**
  * Common surface for SDK errors so callers can log structured context.

@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace UsageMeter;
+namespace Tokentify;
 
 /**
  * Immutable speech metering counts for a single API call.

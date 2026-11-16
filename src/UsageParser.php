@@ -2,32 +2,39 @@
 
 declare(strict_types=1);
 
-namespace UsageMeter;
+namespace Tokentify;
 
 /**
- * Extract token usage from provider JSON responses.
+ * Extract token usage (cache included) from provider JSON responses, using one table of provider formats.
+ *
+ * Covers every model of a provider (models share their provider's format). A new provider with its own
+ * format is one entry in {@see self::formats()}; OpenAI-compatible providers need none (unknown providers
+ * are read by their response shape).
  */
 final class UsageParser
 {
-    /** @var list<string> */
-    private const OPENAI_FAMILY = [
-        'openai',
-        'mistral',
-        'groq',
-        'perplexity',
-        'fireworks',
-        'openrouter',
-        'azure',
-    ];
+    /** Providers whose prompt/input count includes cached tokens. Same set as the collector and gateway. */
+    public const OPENAI_FAMILY = ['openai', 'mistral', 'groq', 'perplexity', 'fireworks', 'openrouter', 'azure'];
+
+    private const ANTHROPIC_ONLY_KEYS = ['cache_read_input_tokens', 'cache_creation_input_tokens'];
+
+    /** @var array<string, UsageFormat>|null */
+    private static ?array $formats = null;
 
     public static function normalizeProvider(string $provider): string
     {
         return strtolower(trim($provider));
     }
 
+    public static function isOpenaiFamily(string $provider): bool
+    {
+        return in_array(self::normalizeProvider($provider), self::OPENAI_FAMILY, true);
+    }
+
+    /** Subtract cached prompt tokens already included in OpenAI-family input counts. */
     public static function normalizeOpenaiFamilyUsage(TokenUsage $usage, string $provider): TokenUsage
     {
-        if (! in_array(self::normalizeProvider($provider), self::OPENAI_FAMILY, true)) {
+        if (! self::isOpenaiFamily($provider)) {
             return $usage;
         }
         if ($usage->cacheReadTokens <= 0 || $usage->inputTokens < $usage->cacheReadTokens) {
@@ -42,167 +49,157 @@ final class UsageParser
         );
     }
 
-    public static function fromProviderResponse(string $responseBody, string $provider): TokenUsage
+    /** OpenAI and OpenAI-compatible APIs: Chat Completions, Responses API, DeepSeek-style cache hits. */
+    public static function openaiFormat(): UsageFormat
     {
-        try {
-            /** @var mixed $data */
-            $data = json_decode($responseBody, true, 512, JSON_THROW_ON_ERROR);
-        } catch (\JsonException) {
-            return new TokenUsage();
-        }
-
-        if (! is_array($data)) {
-            return new TokenUsage();
-        }
-
-        return self::fromUsageArray($data, $provider);
+        return self::formats()['openai'];
     }
 
     /**
+     * The one table of provider usage formats.
+     *
+     * @return array<string, UsageFormat>
+     */
+    public static function formats(): array
+    {
+        if (self::$formats !== null) {
+            return self::$formats;
+        }
+        $openai = new UsageFormat(
+            [['usage'], ['response', 'usage']],
+            ['prompt_tokens', 'input_tokens'],
+            ['completion_tokens', 'output_tokens'],
+            ['prompt_tokens_details.cached_tokens', 'input_tokens_details.cached_tokens', 'prompt_cache_hit_tokens'],
+            [],
+            true,
+        );
+        $formats = [];
+        foreach (self::OPENAI_FAMILY as $name) {
+            $formats[$name] = $openai;
+        }
+        // Anthropic Messages (also the message_start / message_delta stream events).
+        $formats['anthropic'] = new UsageFormat(
+            [['usage'], ['message', 'usage']],
+            ['input_tokens'],
+            ['output_tokens'],
+            ['cache_read_input_tokens'],
+            ['cache_creation_input_tokens'],
+        );
+        // Google Gemini: promptTokenCount includes cachedContentTokenCount.
+        $formats['google'] = new UsageFormat(
+            [['usageMetadata']],
+            ['promptTokenCount'],
+            ['candidatesTokenCount'],
+            ['cachedContentTokenCount'],
+            [],
+            true,
+        );
+        // AWS Bedrock Converse (camelCase) and Anthropic-on-Bedrock InvokeModel (snake_case); input excludes cache.
+        $formats['bedrock'] = new UsageFormat(
+            [['usage']],
+            ['inputTokens', 'input_tokens'],
+            ['outputTokens', 'output_tokens'],
+            ['cacheReadInputTokens', 'cache_read_input_tokens'],
+            ['cacheWriteInputTokens', 'cache_creation_input_tokens'],
+        );
+        // Cohere v1 (meta.billed_units) and v2 (usage.billed_units). No prompt caching.
+        $formats['cohere'] = new UsageFormat(
+            [['meta', 'billed_units'], ['usage', 'billed_units']],
+            ['input_tokens'],
+            ['output_tokens'],
+        );
+
+        return self::$formats = $formats;
+    }
+
+    /** Parse a non-streaming JSON response body for token usage. */
+    public static function fromProviderResponse(string $responseBody, string $provider): TokenUsage
+    {
+        try {
+            $data = json_decode($responseBody, true, 512, JSON_THROW_ON_ERROR);
+        } catch (\Throwable) {
+            return new TokenUsage();
+        }
+
+        return is_array($data) ? self::fromUsageArray($data, $provider) : new TokenUsage();
+    }
+
+    /**
+     * Normalize vendor-native usage blocks to TokenUsage.
+     *
      * @param array<string, mixed> $data
      */
     public static function fromUsageArray(array $data, string $provider): TokenUsage
     {
         $provider = self::normalizeProvider($provider);
-        /** @var array<string, mixed> $usage */
-        $usage = [];
+        try {
+            $format = self::formats()[$provider] ?? self::guessFormat($data);
+            $usage = $format->parse($data);
+            if ($usage === null && $provider === 'bedrock') {
+                $usage = self::bedrockLegacy($data);
+            }
 
-        if ($provider === 'anthropic') {
-            $u = $data['usage'] ?? null;
-            if (is_array($u)) {
-                $usage['input_tokens'] = $u['input_tokens'] ?? 0;
-                $usage['output_tokens'] = $u['output_tokens'] ?? 0;
-                $usage['cache_creation_input_tokens'] = $u['cache_creation_input_tokens'] ?? 0;
-                $usage['cache_read_input_tokens'] = $u['cache_read_input_tokens'] ?? 0;
-            }
-        } elseif (in_array($provider, self::OPENAI_FAMILY, true)) {
-            $u = $data['usage'] ?? null;
-            if (is_array($u)) {
-                $usage = self::parseOpenaiUsage($u);
-            }
-        } elseif ($provider === 'google') {
-            $u = $data['usageMetadata'] ?? null;
-            if (is_array($u)) {
-                $usage['input_tokens'] = $u['promptTokenCount'] ?? 0;
-                $usage['output_tokens'] = $u['candidatesTokenCount'] ?? 0;
-            }
-        } elseif ($provider === 'cohere') {
-            $meta = $data['meta'] ?? null;
-            if (is_array($meta)) {
-                $billed = $meta['billed_units'] ?? null;
-                if (is_array($billed)) {
-                    $usage['input_tokens'] = $billed['input_tokens'] ?? 0;
-                    $usage['output_tokens'] = $billed['output_tokens'] ?? 0;
-                }
-            }
-        } elseif ($provider === 'bedrock') {
-            if (isset($data['usage']) && is_array($data['usage'])) {
-                $u = $data['usage'];
-                $usage['input_tokens'] = $u['inputTokens'] ?? $u['input_tokens'] ?? 0;
-                $usage['output_tokens'] = $u['outputTokens'] ?? $u['output_tokens'] ?? 0;
-            } elseif (array_key_exists('prompt_token_count', $data)) {
-                $usage['input_tokens'] = $data['prompt_token_count'] ?? 0;
-                $usage['output_tokens'] = $data['generation_token_count'] ?? 0;
-            } elseif (array_key_exists('inputTextTokenCount', $data)) {
-                $results = $data['results'] ?? [[]];
-                $result = is_array($results[0] ?? null) ? $results[0] : [];
-                $usage['input_tokens'] = $data['inputTextTokenCount'] ?? 0;
-                $usage['output_tokens'] = $result['tokenCount'] ?? 0;
-            }
-        }
-
-        if ($usage === []) {
+            return $usage ?? new TokenUsage();
+        } catch (\Throwable) {
             return new TokenUsage();
         }
-
-        return TokenUsage::fromInternalUsage($usage);
     }
 
     /**
+     * Extract usage from a single parsed SSE JSON event (streaming).
+     *
      * @param array<string, mixed> $event
      */
     public static function fromSseEvent(array $event, string $provider): TokenUsage
     {
-        $provider = self::normalizeProvider($provider);
-        /** @var array<string, mixed> $usage */
-        $usage = [];
-
-        if ($provider === 'anthropic') {
-            $eventType = (string) ($event['type'] ?? '');
-            if ($eventType === 'message_start') {
-                $msg = $event['message'] ?? null;
-                if (is_array($msg)) {
-                    $u = $msg['usage'] ?? null;
-                    if (is_array($u)) {
-                        $usage['input_tokens'] = $u['input_tokens'] ?? 0;
-                        $usage['cache_creation_input_tokens'] = $u['cache_creation_input_tokens'] ?? 0;
-                        $usage['cache_read_input_tokens'] = $u['cache_read_input_tokens'] ?? 0;
-                    }
-                }
-            } elseif ($eventType === 'message_delta') {
-                $u = $event['usage'] ?? null;
-                if (is_array($u)) {
-                    $usage['output_tokens'] = $u['output_tokens'] ?? 0;
-                }
-            }
-        } elseif (in_array($provider, self::OPENAI_FAMILY, true)) {
-            $u = $event['usage'] ?? null;
-            if (is_array($u)) {
-                $usage = self::parseOpenaiUsage($u);
-            }
-        } elseif ($provider === 'google') {
-            $u = $event['usageMetadata'] ?? null;
-            if (is_array($u)) {
-                $usage['input_tokens'] = $u['promptTokenCount'] ?? 0;
-                $usage['output_tokens'] = $u['candidatesTokenCount'] ?? 0;
-            }
-        } elseif ($provider === 'cohere') {
-            $meta = $event['meta'] ?? null;
-            if (is_array($meta)) {
-                $billed = $meta['billed_units'] ?? null;
-                if (is_array($billed)) {
-                    $usage['input_tokens'] = $billed['input_tokens'] ?? 0;
-                    $usage['output_tokens'] = $billed['output_tokens'] ?? 0;
-                }
-            }
-        }
-
-        if ($usage === []) {
-            return new TokenUsage();
-        }
-
-        return TokenUsage::fromInternalUsage($usage);
+        return self::fromUsageArray($event, $provider);
     }
 
     /**
-     * @param array<string, mixed> $usage
-     * @return array<string, mixed>
+     * Format for a provider not in the table, from the response's own shape.
+     *
+     * @param array<string, mixed> $data
      */
-    private static function parseOpenaiUsage(array $usage): array
+    private static function guessFormat(array $data): UsageFormat
     {
-        $prompt = (int) ($usage['prompt_tokens'] ?? 0);
-        $cached = self::openaiCachedTokens($usage);
-        $out = [
-            'input_tokens' => max(0, $prompt - $cached),
-            'output_tokens' => (int) ($usage['completion_tokens'] ?? 0),
-        ];
-        if ($cached > 0) {
-            $out['cache_read_input_tokens'] = $cached;
+        if (isset($data['usageMetadata']) && is_array($data['usageMetadata'])) {
+            return self::formats()['google'];
+        }
+        $usage = UsageFormat::dig($data, ['usage']) ?? UsageFormat::dig($data, ['message', 'usage']);
+        if (is_array($usage)) {
+            foreach (self::ANTHROPIC_ONLY_KEYS as $key) {
+                if (array_key_exists($key, $usage)) {
+                    return self::formats()['anthropic'];
+                }
+            }
         }
 
-        return $out;
+        return self::openaiFormat();
     }
 
     /**
-     * @param array<string, mixed> $usage
+     * Older Bedrock InvokeModel bodies with top-level counts (Llama, Titan). No caching there.
+     *
+     * @param array<string, mixed> $data
      */
-    private static function openaiCachedTokens(array $usage): int
+    private static function bedrockLegacy(array $data): ?TokenUsage
     {
-        $details = $usage['prompt_tokens_details'] ?? null;
-        if (! is_array($details)) {
-            return 0;
+        if (array_key_exists('prompt_token_count', $data)) {
+            return new TokenUsage(
+                (int) ($data['prompt_token_count'] ?? 0),
+                (int) ($data['generation_token_count'] ?? 0),
+            );
+        }
+        if (array_key_exists('inputTextTokenCount', $data)) {
+            $results = $data['results'] ?? [[]];
+            $result = is_array($results) && isset($results[0]) && is_array($results[0]) ? $results[0] : [];
+
+            return new TokenUsage(
+                (int) ($data['inputTextTokenCount'] ?? 0),
+                (int) ($result['tokenCount'] ?? 0),
+            );
         }
 
-        return (int) ($details['cached_tokens'] ?? 0);
+        return null;
     }
 }

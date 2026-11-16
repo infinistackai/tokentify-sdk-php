@@ -1,3 +1,5 @@
+> **Legacy (0.4.x `UsageMeter\` API).** This page describes the deprecated `UsageMeter\Meter` / `UsageMeter\Tokentify` classes, which still work in 0.5 by delegating to `Tokentify\Tokentify`. Passing `api_key` is no longer accepted: set `TOKENTIFY_API_KEY` in `.env`. For new code, see the [README](README.md) (automatic tracking, `withTags()`, agents, streaming).
+
 # Tokentify / UsageMeter — PHP API integration (Cursor handoff)
 
 Use this document as the **single source of truth** when wiring a PHP backend to the UsageMeter collector and the `tokentifyai/usagemeter` package. Paste it into Cursor (or attach `@sdk/php/INTEGRATION.md`) so the agent implements **ingest + attribution** without guessing.

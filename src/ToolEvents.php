@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace UsageMeter;
+namespace Tokentify;
 
 /**
  * Build tool-usage ingest events for agent tool executions.
@@ -55,6 +55,9 @@ final class ToolEvents
         foreach ($extraMetadata as $k => $v) {
             $tags[(string) $k] = $v;
         }
+        $attributionOptions = $options;
+        unset($attributionOptions['trace_id']);
+        Attribution::applyCallAttribution($tags, $attributionOptions);
 
         $tags['event_type'] = self::TOOL_EVENT_TYPE;
         $tags['trace_id'] = $traceId;
@@ -116,12 +119,12 @@ final class ToolEvents
 
         $eventId = isset($options['event_id']) && is_string($options['event_id']) && $options['event_id'] !== ''
             ? $options['event_id']
-            : self::uuidV4();
+            : LlmEvents::uuidV4();
 
         $event = [
             'event_id' => $eventId,
             'event_type' => self::TOOL_EVENT_TYPE,
-            'timestamp' => self::formatTimestamp($options['timestamp'] ?? null),
+            'timestamp' => LlmEvents::formatTimestamp($options['timestamp'] ?? null),
             'provider' => $provider,
             'model' => $model,
             'endpoint' => $endpoint,
@@ -153,11 +156,11 @@ final class ToolEvents
     private static function resolveSpanId(mixed $value): string
     {
         if ($value === null || (is_string($value) && trim($value) === '')) {
-            return self::uuidV4();
+            return LlmEvents::uuidV4();
         }
         $text = trim((string) $value);
         if ($text === '') {
-            return self::uuidV4();
+            return LlmEvents::uuidV4();
         }
 
         return $text;
@@ -166,11 +169,11 @@ final class ToolEvents
     private static function requireNonEmptyString(mixed $value, string $field): string
     {
         if ($value === null || (is_string($value) && trim($value) === '')) {
-            throw new \InvalidArgumentException("tokentifyai-usagemeter: track_tool() requires {$field}=");
+            throw new \InvalidArgumentException("tokentify: track_tool() requires {$field}=");
         }
         $text = trim((string) $value);
         if ($text === '') {
-            throw new \InvalidArgumentException("tokentifyai-usagemeter: track_tool() requires {$field}=");
+            throw new \InvalidArgumentException("tokentify: track_tool() requires {$field}=");
         }
 
         return $text;
@@ -180,13 +183,13 @@ final class ToolEvents
     {
         if ($status === null || (is_string($status) && trim($status) === '')) {
             throw new \InvalidArgumentException(
-                "tokentifyai-usagemeter: track_tool() requires status= ('success' or 'error')"
+                "tokentify: track_tool() requires status= ('success' or 'error')"
             );
         }
         $text = strtolower(trim((string) $status));
         if (! in_array($text, self::VALID_TOOL_STATUSES, true)) {
             throw new \InvalidArgumentException(
-                "tokentifyai-usagemeter: track_tool() status must be 'success' or 'error'"
+                "tokentify: track_tool() status must be 'success' or 'error'"
             );
         }
 
@@ -200,37 +203,18 @@ final class ToolEvents
         }
         if (! is_int($value) && ! is_float($value) && ! is_string($value)) {
             throw new \InvalidArgumentException(
-                'tokentifyai-usagemeter: track_tool() duration_ms must be an int >= 0'
+                'tokentify: track_tool() duration_ms must be an int >= 0'
             );
         }
         $duration = (int) $value;
         if ($duration < 0) {
             throw new \InvalidArgumentException(
-                'tokentifyai-usagemeter: track_tool() duration_ms must be an int >= 0'
+                'tokentify: track_tool() duration_ms must be an int >= 0'
             );
         }
 
         return $duration;
     }
 
-    private static function formatTimestamp(mixed $timestamp): string
-    {
-        if (is_int($timestamp) || is_float($timestamp)) {
-            return gmdate('Y-m-d\TH:i:s\Z', (int) $timestamp);
-        }
-        if (is_string($timestamp) && trim($timestamp) !== '') {
-            return trim($timestamp);
-        }
 
-        return gmdate('Y-m-d\TH:i:s\Z');
-    }
-
-    private static function uuidV4(): string
-    {
-        $b = random_bytes(16);
-        $b[6] = chr((ord($b[6]) & 0x0f) | 0x40);
-        $b[8] = chr((ord($b[8]) & 0x3f) | 0x80);
-
-        return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($b), 4));
-    }
 }

@@ -1,3 +1,5 @@
+> **Legacy (0.4.x `UsageMeter\` API).** This page describes the deprecated `UsageMeter\Meter` / `UsageMeter\Tokentify` classes, which still work in 0.5 by delegating to `Tokentify\Tokentify`. Passing `api_key` is no longer accepted: set `TOKENTIFY_API_KEY` in `.env`. For new code, see the [README](README.md) (automatic tracking, `withTags()`, agents, streaming).
+
 # Model-call metadata and the PHP SDK
 
 This document answers: **can billing metadata come from each AI call instead of `Tokentify::init()`?**

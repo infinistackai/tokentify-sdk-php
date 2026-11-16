@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace UsageMeter;
+namespace Tokentify;
 
 /**
  * Immutable token counts for a single LLM API call.

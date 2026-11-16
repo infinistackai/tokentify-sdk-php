@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace UsageMeter;
+namespace Tokentify;
 
 /**
  * Maps Tokentify-style tracking field names onto flat group_key_N / group_value_N pairs

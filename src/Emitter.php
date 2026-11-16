@@ -2,55 +2,146 @@
 
 declare(strict_types=1);
 
-namespace UsageMeter;
+namespace Tokentify;
 
-use UsageMeter\Exception\TransportException;
+use Tokentify\Exception\TransportException;
 
 /**
- * Batches usage events and POSTs them to the collector /v1/ingest endpoint.
+ * Batches usage events and POSTs them to the collector `/v1/ingest` endpoint.
  *
- * Same batching semantics as the Python SDK: batch size 50, flush on shutdown
- * and when the queue exceeds the batch size.
+ * PHP has no background thread, so this is the synchronous equivalent of the Python emitter:
+ * events sit in an in-memory queue and are sent when the queue reaches the batch size, when you call
+ * {@see Tokentify::flush()}, or when the PHP process shuts down (`register_shutdown_function`).
+ * Long-running workers (queues, Octane, RoadRunner, Swoole) should call `Tokentify::flush()` after each job.
+ *
+ * Retries 429 / 5xx / network errors with exponential backoff, bounded by the flush deadline.
+ * Delivery failures are dropped (logged in debug mode) unless `failOnDeliveryError` is set.
  */
 final class Emitter
 {
-    private const DEFAULT_BATCH_SIZE = 50;
+    public const BATCH_SIZE = 50;
 
-    private const MAX_RETRIES = 5;
+    public const MAX_QUEUE_SIZE = 10000;
 
-    private const BASE_BACKOFF_MS = 500;
+    public const MAX_RETRIES = 5;
+
+    public const RETRY_BACKOFF_BASE = 0.5;
+
+    /** Seconds allowed for the final flush when PHP shuts down. */
+    public const SHUTDOWN_FLUSH_TIMEOUT = 2.0;
+
+    private readonly string $collectorUrl;
 
     private readonly int $batchSize;
-
-    private readonly bool $autoFlushOnBatch;
 
     /** @var list<array<string, mixed>> */
     private array $queue = [];
 
-    private bool $shutdownHandlerRegistered = false;
+    private bool $shutdownRegistered = false;
 
+    private bool $closed = false;
+
+    /** @var (callable(string, string, array<string, string>, ?string, float): array{0: ?int, 1: array<string, string>, 2: string})|null */
+    private $httpHandler;
+
+    /**
+     * @param (callable(string, string, array<string, string>, ?string, float): array{0: ?int, 1: array<string, string>, 2: string})|null $httpHandler
+     *        Optional replacement for the built-in cURL / stream client: `fn(method, url, headers, body, timeout)`
+     *        returning `[status|null, headers, body]`. Used by tests and by apps that route egress through their own client.
+     */
     public function __construct(
-        private readonly string $collectorUrl,
+        string $collectorUrl,
         private readonly string $apiKey,
-        private readonly bool $debug,
-        private readonly float $timeoutSeconds,
-        private readonly bool $verifyTls,
+        private readonly bool $debug = false,
+        private readonly float $timeout = 30.0,
+        private readonly bool $verifyTls = true,
         private readonly bool $failOnDeliveryError = false,
-        int $batchSize = self::DEFAULT_BATCH_SIZE,
-        bool $autoFlushOnBatch = true,
+        int $batchSize = self::BATCH_SIZE,
+        private readonly bool $autoFlushOnBatch = true,
+        ?callable $httpHandler = null,
     ) {
+        $this->collectorUrl = rtrim($collectorUrl, '/');
         $this->batchSize = max(1, $batchSize);
-        $this->autoFlushOnBatch = $autoFlushOnBatch;
+        $this->httpHandler = $httpHandler;
     }
 
+    public function collectorUrl(): string
+    {
+        return $this->collectorUrl;
+    }
+
+    /** Number of events waiting to be sent. */
     public function queueDepth(): int
     {
         return count($this->queue);
     }
 
+    /**
+     * Events waiting to be sent (copy).
+     *
+     * @return list<array<string, mixed>>
+     */
+    public function pending(): array
+    {
+        return $this->queue;
+    }
+
+    // ── Health check ─────────────────────────────────────────────────
+
+    /**
+     * Verify the collector is reachable (`GET /health`).
+     *
+     * @throws TransportException
+     */
+    public function checkConnection(): void
+    {
+        $url = $this->collectorUrl . '/health';
+        [$status, , $body] = $this->request('GET', $url, null, min($this->timeout, 10.0));
+        if ($status === null) {
+            throw TransportException::collectorUnreachable('GET /health', $url, new \RuntimeException($body));
+        }
+        if ($status < 200 || $status >= 300) {
+            throw TransportException::badHttpStatus('GET /health', $url, $status, $body);
+        }
+        $this->log('collector health check OK');
+    }
+
+    /**
+     * Verify the ingest API key is accepted (`POST /v1/ingest` with an empty batch).
+     *
+     * @throws TransportException
+     */
+    public function checkIngestAuth(): void
+    {
+        $url = $this->collectorUrl . '/v1/ingest';
+        [$status, , $body] = $this->request('POST', $url, '{"events":[]}', min($this->timeout, 10.0));
+        if ($status === null) {
+            throw TransportException::collectorUnreachable('POST /v1/ingest (auth check)', $url, new \RuntimeException($body));
+        }
+        if ($status === 401 || $status === 403) {
+            throw TransportException::invalidApiKey($url, $status, $body);
+        }
+        if ($status >= 400) {
+            throw TransportException::badHttpStatus('POST /v1/ingest (auth check)', $url, $status, $body);
+        }
+        $this->log('ingest auth check OK');
+    }
+
+    // ── Public API ───────────────────────────────────────────────────
+
+    /**
+     * Add an event to the queue. Drops it (debug warning) when the queue is full.
+     *
+     * @param array<string, mixed> $event
+     */
     public function enqueue(array $event): void
     {
-        $this->ensureShutdownFlush();
+        $this->registerShutdownFlush();
+        if (count($this->queue) >= self::MAX_QUEUE_SIZE) {
+            $this->log('queue full, dropping event', true);
+
+            return;
+        }
         $this->queue[] = $event;
         if ($this->autoFlushOnBatch && count($this->queue) >= $this->batchSize) {
             $this->flush();
@@ -58,68 +149,21 @@ final class Emitter
     }
 
     /**
-     * Send all queued events (in chunks of BATCH_SIZE).
+     * Send every queued event, blocking up to $timeout seconds (retries stop at the deadline).
      *
-     * @throws TransportException When fail_on_delivery_error is true and delivery fails after retries.
+     * @throws TransportException Only when `failOnDeliveryError` is enabled.
      */
-    public function flush(): void
+    public function flush(float $timeout = 5.0): void
     {
+        $deadline = microtime(true) + max(0.0, $timeout);
         while ($this->queue !== []) {
             $batch = array_splice($this->queue, 0, $this->batchSize);
-            $this->sendBatch($batch);
+            $this->deliver($batch, $deadline);
         }
     }
 
     /**
-     * @throws TransportException
-     */
-    public function checkConnection(): void
-    {
-        $url = rtrim($this->collectorUrl, '/') . '/health';
-        try {
-            $result = $this->request('GET', $url, null);
-        } catch (\Throwable $e) {
-            throw TransportException::collectorUnreachable('GET /health', $url, $e);
-        }
-        if ($result['code'] < 200 || $result['code'] >= 300) {
-            throw TransportException::badHttpStatus('GET /health', $url, $result['code'], $result['body']);
-        }
-    }
-
-    /**
-     * Validates Bearer token against POST /v1/ingest with an empty events list.
-     *
-     * @throws TransportException
-     */
-    public function checkIngestAuth(): void
-    {
-        $url = rtrim($this->collectorUrl, '/') . '/v1/ingest';
-        try {
-            $result = $this->request('POST', $url, '{"events":[]}');
-        } catch (\Throwable $e) {
-            throw TransportException::collectorUnreachable('POST /v1/ingest (auth probe)', $url, $e);
-        }
-        $code = $result['code'];
-        if ($code === 401 || $code === 403) {
-            throw TransportException::badHttpStatus(
-                'POST /v1/ingest (auth probe)',
-                $url,
-                $code,
-                $result['body'],
-            );
-        }
-        if ($code < 200 || $code >= 300) {
-            throw TransportException::badHttpStatus(
-                'POST /v1/ingest (auth probe)',
-                $url,
-                $code,
-                $result['body'],
-            );
-        }
-    }
-
-    /**
-     * Remove context-window Redis state for an ended session.
+     * Remove context-window Redis state for an ended session (`DELETE /v1/sessions/{id}`).
      */
     public function endSession(string $sessionId, float $timeout = 5.0): bool
     {
@@ -127,208 +171,249 @@ final class Emitter
         if ($sid === '') {
             return false;
         }
-        $url = rtrim($this->collectorUrl, '/') . '/v1/sessions/' . rawurlencode($sid);
-        try {
-            $result = $this->request('DELETE', $url, null, $timeout);
-        } catch (\Throwable $e) {
-            if ($this->debug) {
-                error_log('[usagemeter-php] endSession failed for ' . $sid . ': ' . $e->getMessage());
-            }
+        [$status, , $body] = $this->request('DELETE', $this->collectorUrl . '/v1/sessions/' . rawurlencode($sid), null, $timeout);
+        if ($status === null) {
+            $this->log("end_session failed for {$sid}: {$body}", true);
 
             return false;
         }
-        if ($result['code'] >= 400) {
-            if ($this->debug) {
-                error_log(
-                    '[usagemeter-php] endSession returned ' . $result['code'] . ': '
-                    . substr($result['body'], 0, 200)
-                );
-            }
+        if ($status >= 400) {
+            $this->log("end_session returned {$status}: " . substr($body, 0, 200), true);
 
             return false;
         }
         try {
-            /** @var mixed $data */
-            $data = json_decode($result['body'], true, 512, JSON_THROW_ON_ERROR);
-            if (is_array($data)) {
-                return (bool) ($data['cleared'] ?? false);
-            }
-        } catch (\JsonException) {
-            return $result['code'] >= 200 && $result['code'] < 300;
+            $data = json_decode($body, true, 512, JSON_THROW_ON_ERROR);
+        } catch (\Throwable) {
+            return $status < 300;
         }
 
-        return $result['code'] >= 200 && $result['code'] < 300;
+        return is_array($data) && (bool) ($data['cleared'] ?? false);
     }
 
-    private function ensureShutdownFlush(): void
+    /** Flush what is queued and stop accepting the shutdown hook's work. */
+    public function shutdown(float $timeout = 5.0): void
     {
-        if ($this->shutdownHandlerRegistered) {
+        try {
+            $this->flush($timeout);
+        } finally {
+            $this->closed = true;
+        }
+    }
+
+    /**
+     * Synchronously POST one batch and return `[status, headers, body]` without retrying.
+     *
+     * For callers that own their own durable queue: they decide whether to delete, retry or dead-letter
+     * the batch (and can honour `Retry-After` on a 429). `status` is null when no response came back
+     * (connection error / timeout); the body then carries the error message.
+     *
+     * @param list<array<string, mixed>> $batch
+     * @return array{0: ?int, 1: array<string, string>, 2: string}
+     */
+    public function sendBatch(array $batch): array
+    {
+        if ($batch === []) {
+            return [null, [], ''];
+        }
+        try {
+            $payload = json_encode(['events' => $batch], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
+        } catch (\JsonException $e) {
+            return [null, [], 'tokentify: could not encode events: ' . $e->getMessage()];
+        }
+
+        return $this->request('POST', $this->collectorUrl . '/v1/ingest', $payload, $this->timeout);
+    }
+
+    // ── Internal ─────────────────────────────────────────────────────
+
+    /**
+     * POST a batch with retries on 429 / 5xx / network errors until $deadline. Drops on failure.
+     *
+     * @param list<array<string, mixed>> $batch
+     * @throws TransportException
+     */
+    private function deliver(array $batch, float $deadline): void
+    {
+        $url = $this->collectorUrl . '/v1/ingest';
+        $lastError = null;
+        for ($attempt = 0; $attempt <= self::MAX_RETRIES; $attempt++) {
+            [$status, , $body] = $this->sendBatch($batch);
+            if ($status !== null && $status < 400) {
+                $this->log('sent ' . count($batch) . ' events');
+
+                return;
+            }
+            if ($status !== null && $status !== 429 && $status < 500) {
+                $lastError = TransportException::badHttpStatus('POST /v1/ingest', $url, $status, $body);
+                break; // not retryable
+            }
+            $lastError = $status === null
+                ? TransportException::collectorUnreachable('POST /v1/ingest', $url, new \RuntimeException($body))
+                : TransportException::badHttpStatus('POST /v1/ingest', $url, $status, $body);
+
+            $sleep = self::RETRY_BACKOFF_BASE * (2 ** $attempt);
+            if ($attempt === self::MAX_RETRIES || microtime(true) + $sleep >= $deadline) {
+                break;
+            }
+            usleep((int) ($sleep * 1_000_000));
+        }
+
+        $this->log('dropping ' . count($batch) . ' events: ' . ($lastError?->getMessage() ?? 'unknown error'), true);
+        if ($this->failOnDeliveryError && $lastError !== null) {
+            throw $lastError;
+        }
+    }
+
+    private function registerShutdownFlush(): void
+    {
+        if ($this->shutdownRegistered) {
             return;
         }
-        $this->shutdownHandlerRegistered = true;
+        $this->shutdownRegistered = true;
         register_shutdown_function(function (): void {
+            if ($this->closed) {
+                return;
+            }
             try {
-                $this->flush();
+                $this->flush(self::SHUTDOWN_FLUSH_TIMEOUT);
             } catch (\Throwable) {
-                // Never break shutdown
+                // Never break shutdown.
             }
         });
     }
 
     /**
-     * @param list<array<string, mixed>> $batch
-     *
-     * @throws TransportException
+     * @return array{0: ?int, 1: array<string, string>, 2: string}
      */
-    private function sendBatch(array $batch): void
+    private function request(string $method, string $url, ?string $body, float $timeout): array
     {
-        if ($batch === []) {
-            return;
+        $headers = [
+            'Authorization' => 'Bearer ' . $this->apiKey,
+            'User-Agent' => 'tokentify-sdk-php/' . LlmEvents::SDK_VERSION,
+        ];
+        if ($body !== null) {
+            $headers['Content-Type'] = 'application/json';
         }
-        $url = rtrim($this->collectorUrl, '/') . '/v1/ingest';
-        $body = json_encode(['events' => $batch], JSON_THROW_ON_ERROR);
-
-        $lastError = null;
-        for ($attempt = 0; $attempt < self::MAX_RETRIES; $attempt++) {
-            try {
-                $result = $this->request('POST', $url, $body);
-                $code = $result['code'];
-                if ($code < 400) {
-                    if ($this->debug) {
-                        error_log('[usagemeter-php] Sent ' . count($batch) . ' events');
-                    }
-
-                    return;
-                }
-                if ($code >= 400 && $code < 500 && $code !== 429) {
-                    if ($this->debug) {
-                        error_log('[usagemeter-php] Non-retryable HTTP ' . $code . ' body=' . substr($result['body'], 0, 300));
-                    }
-                    if ($this->failOnDeliveryError) {
-                        throw TransportException::badHttpStatus('POST /v1/ingest', $url, $code, $result['body']);
-                    }
-
-                    return;
-                }
-                $lastError = TransportException::badHttpStatus('POST /v1/ingest', $url, $code, $result['body']);
-            } catch (TransportException $e) {
-                throw $e;
-            } catch (\Throwable $e) {
-                $lastError = TransportException::collectorUnreachable('POST /v1/ingest', $url, $e);
+        try {
+            if ($this->httpHandler !== null) {
+                return ($this->httpHandler)($method, $url, $headers, $body, $timeout);
             }
-            if ($attempt < self::MAX_RETRIES - 1) {
-                usleep((int) (self::BASE_BACKOFF_MS * 1000 * (2 ** $attempt)));
+            if (function_exists('curl_init')) {
+                return $this->requestCurl($method, $url, $headers, $body, $timeout);
             }
-        }
-        if ($this->failOnDeliveryError && $lastError !== null) {
-            throw $lastError;
-        }
-        if ($this->debug && $lastError !== null) {
-            error_log('[usagemeter-php] Dropped batch after retries: ' . $lastError->getMessage());
+
+            return $this->requestStream($method, $url, $headers, $body, $timeout);
+        } catch (\Throwable $e) {
+            return [null, [], $e->getMessage()];
         }
     }
 
     /**
-     * @return array{code: int, body: string}
+     * @param array<string, string> $headers
+     * @return array{0: ?int, 1: array<string, string>, 2: string}
      */
-    private function request(string $method, string $url, ?string $body, ?float $timeoutSeconds = null): array
-    {
-        if (function_exists('curl_init')) {
-            return $this->requestCurl($method, $url, $body, $timeoutSeconds);
-        }
-
-        return $this->requestStream($method, $url, $body, $timeoutSeconds);
-    }
-
-    /**
-     * @return array{code: int, body: string}
-     */
-    private function requestCurl(string $method, string $url, ?string $body, ?float $timeoutSeconds = null): array
+    private function requestCurl(string $method, string $url, array $headers, ?string $body, float $timeout): array
     {
         $ch = curl_init($url);
         if ($ch === false) {
-            throw new \RuntimeException('curl_init failed for ' . $url);
+            return [null, [], 'curl_init failed for ' . $url];
         }
-        $headers = [
-            'Authorization: Bearer ' . $this->apiKey,
-            'User-Agent: tokentifyai-usagemeter-php/' . LlmEvents::SDK_VERSION,
-        ];
-        if ($method === 'POST') {
-            $headers[] = 'Content-Type: application/json';
+        $responseHeaders = [];
+        $lines = [];
+        foreach ($headers as $name => $value) {
+            $lines[] = $name . ': ' . $value;
         }
-        $timeout = $timeoutSeconds ?? $this->timeoutSeconds;
-        $curlOpts = [
-            CURLOPT_HTTPHEADER => $headers,
+        $timeoutMs = (int) max(1000, ceil($timeout * 1000));
+        $options = [
+            CURLOPT_HTTPHEADER => $lines,
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_HEADER => false,
-            CURLOPT_TIMEOUT => (int) max(1, (int) ceil($timeout)),
+            CURLOPT_TIMEOUT_MS => $timeoutMs,
+            CURLOPT_CONNECTTIMEOUT_MS => min($timeoutMs, 5000),
+            CURLOPT_HEADERFUNCTION => static function ($ch, string $line) use (&$responseHeaders): int {
+                $parts = explode(':', $line, 2);
+                if (count($parts) === 2) {
+                    $responseHeaders[strtolower(trim($parts[0]))] = trim($parts[1]);
+                }
+
+                return strlen($line);
+            },
         ];
         if ($method === 'GET') {
-            $curlOpts[CURLOPT_HTTPGET] = true;
+            $options[CURLOPT_HTTPGET] = true;
         } else {
-            $curlOpts[CURLOPT_CUSTOMREQUEST] = $method;
+            $options[CURLOPT_CUSTOMREQUEST] = $method;
             if ($body !== null) {
-                $curlOpts[CURLOPT_POSTFIELDS] = $body;
+                $options[CURLOPT_POSTFIELDS] = $body;
             }
         }
-        curl_setopt_array($ch, $curlOpts);
         if (! $this->verifyTls) {
-            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
+            $options[CURLOPT_SSL_VERIFYPEER] = false;
+            $options[CURLOPT_SSL_VERIFYHOST] = 0;
         }
+        curl_setopt_array($ch, $options);
         $responseBody = curl_exec($ch);
-        $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         if (curl_errno($ch) !== 0) {
-            $err = curl_error($ch);
+            $error = curl_error($ch);
             curl_close($ch);
-            throw new \RuntimeException('curl error (' . $url . '): ' . $err);
+
+            return [null, [], 'curl error (' . $url . '): ' . $error];
         }
+        $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
 
-        return [
-            'code' => $code,
-            'body' => is_string($responseBody) ? $responseBody : '',
-        ];
+        return [$status, $responseHeaders, is_string($responseBody) ? $responseBody : ''];
     }
 
     /**
-     * @return array{code: int, body: string}
+     * @param array<string, string> $headers
+     * @return array{0: ?int, 1: array<string, string>, 2: string}
      */
-    private function requestStream(string $method, string $url, ?string $body, ?float $timeoutSeconds = null): array
+    private function requestStream(string $method, string $url, array $headers, ?string $body, float $timeout): array
     {
-        $headers = 'Authorization: Bearer ' . $this->apiKey . "\r\n"
-            . 'User-Agent: tokentifyai-usagemeter-php/' . LlmEvents::SDK_VERSION . "\r\n";
-        if ($method === 'POST' && $body !== null) {
-            $headers .= "Content-Type: application/json\r\n";
+        $headerText = '';
+        foreach ($headers as $name => $value) {
+            $headerText .= $name . ': ' . $value . "\r\n";
         }
-        $timeout = $timeoutSeconds ?? $this->timeoutSeconds;
-        $ctx = [
+        $context = stream_context_create([
             'http' => [
                 'method' => $method,
-                'header' => $headers,
+                'header' => $headerText,
                 'timeout' => $timeout,
                 'ignore_errors' => true,
+                'content' => $body ?? '',
             ],
             'ssl' => [
                 'verify_peer' => $this->verifyTls,
                 'verify_peer_name' => $this->verifyTls,
             ],
-        ];
-        if ($method === 'POST' && $body !== null) {
-            $ctx['http']['content'] = $body;
-        }
-        $context = stream_context_create($ctx);
+        ]);
         $responseBody = @file_get_contents($url, false, $context);
         if ($responseBody === false) {
-            throw new \RuntimeException('file_get_contents failed for ' . $url);
+            return [null, [], 'request failed for ' . $url];
         }
-        $code = 0;
-        if (isset($http_response_header[0]) && is_string($http_response_header[0])) {
-            if (preg_match('#HTTP/\S+\s+(\d+)#', $http_response_header[0], $m)) {
-                $code = (int) $m[1];
+        $status = null;
+        $responseHeaders = [];
+        /** @var list<string> $http_response_header */
+        foreach ($http_response_header ?? [] as $i => $line) {
+            if ($i === 0 && preg_match('#HTTP/\S+\s+(\d+)#', $line, $m) === 1) {
+                $status = (int) $m[1];
+                continue;
+            }
+            $parts = explode(':', $line, 2);
+            if (count($parts) === 2) {
+                $responseHeaders[strtolower(trim($parts[0]))] = trim($parts[1]);
             }
         }
 
-        return ['code' => $code, 'body' => is_string($responseBody) ? $responseBody : ''];
+        return [$status, $responseHeaders, $responseBody];
+    }
+
+    private function log(string $message, bool $warning = false): void
+    {
+        if ($this->debug) {
+            error_log('tokentify: ' . ($warning ? 'warning: ' : '') . $message);
+        }
     }
 }
