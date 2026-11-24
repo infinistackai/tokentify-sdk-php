@@ -8,7 +8,7 @@
         "tokentify/tokentify-sdk": "^0.5"
     },
     "repositories": [
-        { "type": "path", "url": "../.." }
+        { "type": "path", "url": "../..", "options": { "versions": { "tokentify/tokentify-sdk": "0.5.0" } } }
     ],
     "minimum-stability": "dev",
     "prefer-stable": true

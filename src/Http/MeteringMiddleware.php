@@ -57,7 +57,13 @@ final class MeteringMiddleware
                         // rejection reaches the caller unchanged.
                         $response = is_object($reason) && method_exists($reason, 'getResponse') ? $reason->getResponse() : null;
                         if ($response instanceof ResponseInterface) {
-                            $transport->afterResponse($ctx, $response);
+                            // The caller reads this response from the exception, so a body that can't be rewound
+                            // (Guzzle 'stream' => true) is left unread and recorded from its status alone.
+                            if ($response->getBody()->isSeekable()) {
+                                $transport->afterResponse($ctx, $response);
+                            } else {
+                                $transport->onErrorStatus($ctx, $response->getStatusCode());
+                            }
                         } elseif ($reason instanceof \Throwable) {
                             $transport->onFailure($ctx, $reason);
                         }

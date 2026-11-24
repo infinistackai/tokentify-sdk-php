@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.5.0
+
+Brings the PHP SDK to parity with the Python SDK 0.5.0. Events sent to the collector have the same shape as
+the Python SDK's.
 
 ### Changed (events now match the gateway's)
 
@@ -21,11 +24,14 @@
   way; other values are sent unchanged.
 - **`usage_source`** is sent on LLM events, as the gateway does: `reported` when token counts were given,
   `none` when there were none.
-
-## 0.5.0
-
-Brings the PHP SDK to parity with the Python SDK 0.5.0. Events sent to the collector have the same shape as
-the Python SDK's.
+- **OpenAI Assistants calls are not recorded as model calls.** Paths under `/v1/threads` (threads, runs,
+  thread messages) are not LLM calls, so a failed one produces no event. A failed thread-message call is no
+  longer recorded as `/v1/messages`.
+- **Billing:** failed calls now count toward event and request totals (with 0 tokens), the same as gateway
+  traffic.
+- **Known limitations:** a stream that reports no usage still produces no event (the gateway estimates one);
+  provider-SDK retries create one error event per failed attempt; for network errors, `error_code` is a
+  language-specific exception class name.
 
 ### Added
 

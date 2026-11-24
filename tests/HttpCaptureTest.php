@@ -124,6 +124,29 @@ final class HttpCaptureTest extends TestCase
         $this->assertSame(400, $event['http_status']);
     }
 
+    public function testErrorResponseFromOutsideHttpErrorsIsRecordedOnceAndBodyKept(): void
+    {
+        $body = json_encode(['error' => ['message' => 'slow down', 'type' => 'requests', 'code' => 'rate_limit_exceeded']]);
+        foreach ([true, false] as $i => $seekable) {
+            $stream = \GuzzleHttp\Psr7\Utils::streamFor($body);
+            $response = new Response(429, ['Content-Type' => 'application/json'],
+                $seekable ? $stream : new \GuzzleHttp\Psr7\NoSeekStream($stream));
+            $stack = HandlerStack::create(new MockHandler([$response]));
+            $stack->unshift(Tokentify::guzzleMiddleware(), 'tokentify'); // outside http_errors: sees the exception
+            $client = new Client(['handler' => $stack]);
+            try {
+                $client->post('https://api.openai.com/v1/chat/completions', ['json' => ['model' => 'gpt-4o-mini']]);
+                $this->fail('expected a ClientException');
+            } catch (\GuzzleHttp\Exception\ClientException $e) {
+                $this->assertSame($body, (string) $e->getResponse()->getBody(), 'the caller can still read the body');
+            }
+            $this->assertCount($i + 1, self::events(), 'one event per call');
+            $event = self::lastEvent();
+            $this->assertSame(429, $event['http_status']);
+            $this->assertSame($seekable ? 'rate_limit_exceeded' : 'http_429', $event['error_code']);
+        }
+    }
+
     public function testFailedCallIsRecordedLikeTheGateway(): void
     {
         $client = $this->client(self::json(['error' => [
@@ -454,6 +477,11 @@ final class HttpCaptureTest extends TestCase
         $this->assertSame('responses', Transport::detectEndpoint('/v1/responses/'));
         $this->assertSame('embed', Transport::detectEndpoint('/v1/embeddings'));
         $this->assertSame('audio/transcriptions', Transport::detectEndpoint('/v1/audio/transcriptions'));
+        $this->assertSame('messages', Transport::detectEndpoint('/v1/messages'));
+        // OpenAI Assistants thread paths are not model calls (and not Anthropic messages)
+        $this->assertSame('unknown', Transport::detectEndpoint('/v1/threads/thread_abc/messages'));
+        $this->assertSame('unknown', Transport::detectEndpoint('/v1/threads/thread_abc/runs'));
+        $this->assertSame('unknown', Transport::detectEndpoint('/v1/threads'));
         $this->assertSame('anthropic.claude-3-haiku-20240307-v1:0', Transport::modelFromPath('/model/anthropic.claude-3-haiku-20240307-v1%3A0/converse'));
         $this->assertSame('unknown', Transport::modelFromPath('/v1/chat/completions'));
     }

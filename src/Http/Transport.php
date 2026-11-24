@@ -172,6 +172,21 @@ final class Transport
     }
 
     /**
+     * An error response whose body must not be read (it can't be rewound and the caller still needs it):
+     * recorded as a failed call with `error_code` `http_<status>`.
+     */
+    public function onErrorStatus(array $ctx, int $status): void
+    {
+        try {
+            if (! self::recordsFailures($ctx)) {
+                return;
+            }
+            $this->emitLlm($ctx, [], self::elapsedMs($ctx['start']), $status, 'error', self::errorCode(null, $status));
+        } catch (\Throwable) {
+        }
+    }
+
+    /**
      * A short error code for a failed AI call, from the provider's error body: OpenAI `error.code` (else
      * `error.type`), Anthropic `error.type`, Gemini `error.status`; else `http_<status>`. Never the error
      * message, which can echo prompt content.
@@ -229,6 +244,8 @@ final class Transport
 
         return match (true) {
             $p === '' => 'unknown',
+            // OpenAI Assistants (threads, runs, thread messages) are not model calls.
+            str_contains($p, '/threads/') || str_ends_with(rtrim($p, '/'), '/threads') => 'unknown',
             str_contains($p, '/messages') => 'messages',
             str_contains($p, '/chat/completions') => 'chat',
             str_contains($p, '/completions') => 'completions',
