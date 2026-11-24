@@ -32,7 +32,7 @@ final class HttpCaptureTest extends TestCase
     }
 
     /** Guzzle client with the Tokentify middleware over a mock handler. */
-    private function client(Response ...$responses): Client
+    private function client(Response|\Throwable ...$responses): Client
     {
         $stack = HandlerStack::create(new MockHandler($responses));
         $stack->push(Tokentify::guzzleMiddleware(), 'tokentify');
@@ -69,7 +69,7 @@ final class HttpCaptureTest extends TestCase
         $this->assertSame('gpt-4o-mini', $event['model']);
         $this->assertSame(11, $event['input_tokens']);
         $this->assertSame(4, $event['output_tokens']);
-        $this->assertSame('chat', $event['metadata']['endpoint']);
+        $this->assertSame('/v1/chat/completions', $event['metadata']['endpoint']);
         $this->assertSame(200, $event['http_status']);
         $this->assertSame('success', $event['status']);
         $this->assertSame('test-bucket', $event['bucket_name']);
@@ -124,6 +124,141 @@ final class HttpCaptureTest extends TestCase
         $this->assertSame(400, $event['http_status']);
     }
 
+    public function testFailedCallIsRecordedLikeTheGateway(): void
+    {
+        $client = $this->client(self::json(['error' => [
+            'message' => 'Incorrect API key: secret prompt', 'type' => 'invalid_request_error', 'code' => 'invalid_api_key',
+        ]], 401));
+        $thrown = null;
+        try {
+            Tokentify::withTags(
+                ['user_id' => 'u1', 'account_id' => 'acme', 'session_id' => 's1', 'team' => 'search'],
+                fn () => $client->post('https://api.openai.com/v1/chat/completions', ['json' => ['model' => 'gpt-4o-mini']]),
+            );
+        } catch (\GuzzleHttp\Exception\ClientException $e) {
+            $thrown = $e;
+        }
+        $this->assertNotNull($thrown, 'the caller still gets the 401 as before');
+        $this->assertSame(401, $thrown->getResponse()->getStatusCode());
+
+        $this->assertCount(1, self::events());
+        $event = self::lastEvent();
+        $this->assertSame('error', $event['status']);
+        $this->assertSame(401, $event['http_status']);
+        $this->assertSame('invalid_api_key', $event['error_code']);
+        $this->assertSame('/v1/chat/completions', $event['endpoint']);
+        $this->assertSame('none', $event['usage_source']);
+        $this->assertSame('gpt-4o-mini', $event['model']);
+        $this->assertSame(0, $event['input_tokens']);
+        $this->assertSame(0, $event['output_tokens']);
+        $this->assertIsInt($event['latency_ms']);
+        $this->assertSame(
+            ['u1', 'acme', 's1', 'search'],
+            [$event['metadata']['user_id'], $event['metadata']['account_id'], $event['metadata']['session_id'], $event['metadata']['team']],
+        );
+        $this->assertStringNotContainsString('Incorrect API key', json_encode($event), 'the error message is never sent');
+    }
+
+    /** @return iterable<string, array{0: int, 1: array<string, mixed>, 2: string}> */
+    public static function providerErrorBodies(): iterable
+    {
+        yield 'OpenAI error.code' => [429, ['error' => ['type' => 'requests', 'code' => 'rate_limit_exceeded']], 'rate_limit_exceeded'];
+        yield 'Anthropic error.type' => [400, ['type' => 'error', 'error' => ['type' => 'invalid_request_error']], 'invalid_request_error'];
+        yield 'Gemini error.status' => [403, ['error' => ['code' => 403, 'status' => 'PERMISSION_DENIED']], 'PERMISSION_DENIED'];
+        yield 'no error body' => [502, ['detail' => 'bad gateway'], 'http_502'];
+    }
+
+    /**
+     * @dataProvider providerErrorBodies
+     * @param array<string, mixed> $body
+     */
+    public function testErrorCodeComesFromTheProviderBody(int $status, array $body, string $want): void
+    {
+        try {
+            $this->client(self::json($body, $status))->post('https://api.openai.com/v1/chat/completions', ['json' => ['model' => 'm']]);
+        } catch (\GuzzleHttp\Exception\BadResponseException) {
+        }
+        $this->assertCount(1, self::events());
+        $this->assertSame($want, self::lastEvent()['error_code']);
+        $this->assertSame($status, self::lastEvent()['http_status']);
+    }
+
+    public function testErrorCodeHelper(): void
+    {
+        $this->assertSame(64, strlen(Transport::errorCode(json_encode(['error' => ['code' => str_repeat('x', 100)]]), 400)));
+        $this->assertSame('http_503', Transport::errorCode('<html>oops</html>', 503));
+        $this->assertSame('error', Transport::errorCode(null));
+    }
+
+    public function testFailedNonLlmCallsAreNotRecorded(): void
+    {
+        try {
+            $this->client(self::json(['error' => ['code' => 'nope']], 404))->get('https://api.openai.com/v1/models');
+        } catch (\GuzzleHttp\Exception\ClientException) {
+        }
+        try {
+            $this->client(self::json(['error' => ['code' => 'nope']], 404))->get('https://api.openai.com/v1/chat/completions/abc');
+        } catch (\GuzzleHttp\Exception\ClientException) {
+        }
+        $this->assertSame([], self::events(), 'unknown endpoint and non-POST calls are not recorded');
+    }
+
+    public function testNetworkErrorIsRecordedAndRethrown(): void
+    {
+        $request = new Request('POST', 'https://api.openai.com/v1/chat/completions');
+        $client = $this->client(new \GuzzleHttp\Exception\ConnectException('Connection refused', $request));
+        $thrown = null;
+        try {
+            Tokentify::withTags(['account_id' => 'acme'], fn () => $client->post(
+                'https://api.openai.com/v1/chat/completions',
+                ['json' => ['model' => 'gpt-4o-mini']],
+            ));
+        } catch (\GuzzleHttp\Exception\ConnectException $e) {
+            $thrown = $e;
+        }
+        $this->assertNotNull($thrown, 'the caller still gets the original exception');
+        $this->assertSame('Connection refused', $thrown->getMessage());
+
+        $this->assertCount(1, self::events());
+        $event = self::lastEvent();
+        $this->assertSame('error', $event['status']);
+        $this->assertSame('ConnectException', $event['error_code']);
+        $this->assertArrayNotHasKey('http_status', $event, 'no response, so no http_status (as the gateway)');
+        $this->assertSame('/v1/chat/completions', $event['endpoint']);
+        $this->assertSame('none', $event['usage_source']);
+        $this->assertSame('acme', $event['metadata']['account_id']);
+    }
+
+    public function testPsr18NetworkErrorIsRecordedAndRethrown(): void
+    {
+        $inner = new class () implements ClientInterface {
+            public function sendRequest(RequestInterface $request): ResponseInterface
+            {
+                throw new \GuzzleHttp\Exception\ConnectException('timed out', $request);
+            }
+        };
+        $factory = new HttpFactory();
+        $request = $factory->createRequest('POST', 'https://api.anthropic.com/v1/messages')
+            ->withBody($factory->createStream('{"model":"claude-haiku-4-5"}'));
+        $this->expectException(\GuzzleHttp\Exception\ConnectException::class);
+        try {
+            Tokentify::httpClient($inner)->sendRequest($request);
+        } finally {
+            $event = self::lastEvent();
+            $this->assertSame('error', $event['status']);
+            $this->assertSame('ConnectException', $event['error_code']);
+            $this->assertSame('/v1/messages', $event['endpoint']);
+            $this->assertSame('claude-haiku-4-5', $event['model']);
+        }
+    }
+
+    public function testSuccessReportsUsageSource(): void
+    {
+        $this->client(self::json(['usage' => ['prompt_tokens' => 2, 'completion_tokens' => 1]]))
+            ->post('https://api.openai.com/v1/chat/completions', ['json' => ['model' => 'gpt-4o']]);
+        $this->assertSame('reported', self::lastEvent()['usage_source']);
+    }
+
     public function testResponsesWithoutUsageEmitNothing(): void
     {
         $this->client(self::json(['data' => []]))->get('https://api.openai.com/v1/models');
@@ -166,7 +301,7 @@ final class HttpCaptureTest extends TestCase
         $this->assertSame(25, $event['input_tokens']);
         $this->assertSame(15, $event['output_tokens']);
         $this->assertSame(10, $event['cache_read_tokens']);
-        $this->assertSame('messages', $event['metadata']['endpoint']);
+        $this->assertSame('/v1/messages', $event['metadata']['endpoint']);
 
         $body->close();
         $this->assertCount(1, self::events(), 'finalized exactly once');

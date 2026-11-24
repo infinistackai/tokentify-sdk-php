@@ -40,6 +40,8 @@ final class Transport
         'openrouter.ai' => 'openrouter',
     ];
 
+    private const MAX_ERROR_CODE = 64;
+
     /** Providers that put the model in the URL path (Gemini / Vertex, Bedrock runtime). */
     private const PATH_MODEL_PATTERNS = [
         '#/models/([^/:?]+):[A-Za-z]+#',
@@ -92,6 +94,7 @@ final class Transport
             }
 
             return [$request, [
+                'method' => strtoupper($request->getMethod()),
                 'start' => hrtime(true),
                 'timestamp' => microtime(true),
                 'provider' => self::detectProvider($host),
@@ -138,6 +141,9 @@ final class Transport
                 if ($usage !== []) {
                     $ctx['tags'] = ToolCalls::addToolCallTags($ctx['tags'], $content);
                     $this->emitLlm($ctx, $usage, $latencyMs, $httpStatus, $status);
+                } elseif ($status === 'error' && self::recordsFailures($ctx)) {
+                    // A failed LLM call has no usage: record it with 0 tokens and the provider's error code.
+                    $this->emitLlm($ctx, [], $latencyMs, $httpStatus, $status, self::errorCode($content, $httpStatus));
                 }
             }
 
@@ -145,6 +151,48 @@ final class Transport
         } catch (\Throwable) {
             return $response;
         }
+    }
+
+    /**
+     * Record a call that failed without a response (connection error, timeout): 0 tokens, status `error`,
+     * no `http_status` (as the gateway does). The caller rethrows the original exception.
+     *
+     * @param array<string, mixed> $ctx From {@see beforeRequest()}
+     */
+    public function onFailure(array $ctx, \Throwable $error): void
+    {
+        try {
+            if (! self::recordsFailures($ctx)) {
+                return;
+            }
+            $name = (new \ReflectionClass($error))->getShortName();
+            $this->emitLlm($ctx, [], self::elapsedMs($ctx['start']), null, 'error', substr($name, 0, self::MAX_ERROR_CODE));
+        } catch (\Throwable) {
+        }
+    }
+
+    /**
+     * A short error code for a failed AI call, from the provider's error body: OpenAI `error.code` (else
+     * `error.type`), Anthropic `error.type`, Gemini `error.status`; else `http_<status>`. Never the error
+     * message, which can echo prompt content.
+     */
+    public static function errorCode(?string $body, ?int $httpStatus = null): string
+    {
+        try {
+            $data = $body !== null && $body !== '' ? json_decode($body, true) : null;
+            $err = is_array($data) ? ($data['error'] ?? null) : null;
+            if (is_array($err)) {
+                foreach (['code', 'type', 'status'] as $key) {
+                    $value = $err[$key] ?? null;
+                    if (is_string($value) && trim($value) !== '') {
+                        return substr(trim($value), 0, self::MAX_ERROR_CODE);
+                    }
+                }
+            }
+        } catch (\Throwable) {
+        }
+
+        return $httpStatus ? 'http_' . $httpStatus : 'error';
     }
 
     // ── Detection helpers (public for tests and custom transports) ───
@@ -276,8 +324,14 @@ final class Transport
      * @param array<string, mixed> $ctx
      * @param array<string, int> $usage
      */
-    private function emitLlm(array $ctx, array $usage, int $latencyMs, int $httpStatus = 200, string $status = 'success'): void
-    {
+    private function emitLlm(
+        array $ctx,
+        array $usage,
+        int $latencyMs,
+        ?int $httpStatus = 200,
+        string $status = 'success',
+        ?string $errorCode = null,
+    ): void {
         try {
             $event = LlmEvents::buildLlmIngestEvent(
                 [
@@ -288,6 +342,7 @@ final class Transport
                     'latency_ms' => $latencyMs,
                     'http_status' => $httpStatus,
                     'status' => $status,
+                    'error_code' => $errorCode,
                 ],
                 TokenUsage::fromInternalUsage($usage),
                 $this->tagsGetter($ctx),
@@ -322,6 +377,16 @@ final class Transport
             ($this->emit)($event);
         } catch (\Throwable) {
         }
+    }
+
+    /**
+     * Failed calls are recorded only for LLM endpoints (POST), never for model lists, files, etc.
+     *
+     * @param array<string, mixed> $ctx
+     */
+    private static function recordsFailures(array $ctx): bool
+    {
+        return ($ctx['endpoint'] ?? 'unknown') !== 'unknown' && ($ctx['method'] ?? 'POST') === 'POST';
     }
 
     /**

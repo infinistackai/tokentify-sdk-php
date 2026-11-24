@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Changed (events now match the gateway's)
+
+- **Failed AI calls are recorded.** A call to an LLM endpoint that fails before returning usage (a 4xx/5xx
+  response, or a connection error / timeout) is now sent as an event with `status: "error"`, `http_status`
+  (absent for connection errors), `error_code`, 0 tokens and `usage_source: "none"`, with the same user, account,
+  session and tags as a successful call. This works through both `Tokentify::guzzleMiddleware()` and
+  `Tokentify::httpClient()`. Before, these calls were dropped, so rate-limited or rejected traffic never reached
+  the dashboard while the same traffic through the gateway did. `error_code` comes from the provider's error
+  body (OpenAI `error.code` or `error.type`, Anthropic `error.type`, Gemini `error.status`; else
+  `http_<status>`; for connection errors the exception's short class name, e.g. `ConnectException`); never the
+  error message. Exceptions and rejected promises reach your code unchanged. Non-LLM calls (`GET /v1/models`,
+  files, ...) are still not recorded.
+- **`endpoint` is sent in the gateway's form** (`/v1/chat/completions`, `/v1/messages`, `/v1/embeddings`,
+  `/v1/responses`, `/v1/completions`, `/v1/audio/transcriptions|translations|speech`), in the event and in
+  `metadata.endpoint`. Bucket routing rules on `endpoint` (e.g. `starts_with /v1/embeddings`) now match SDK
+  traffic. Short names passed to `track()` / `trackSpeech()` (`endpoint: 'messages'`) are converted the same
+  way; other values are sent unchanged.
+- **`usage_source`** is sent on LLM events, as the gateway does: `reported` when token counts were given,
+  `none` when there were none.
+
 ## 0.5.0
 
 Brings the PHP SDK to parity with the Python SDK 0.5.0. Events sent to the collector have the same shape as

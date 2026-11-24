@@ -124,7 +124,7 @@ final class SpeechEvents
         ];
 
         if (array_key_exists('endpoint', $options) && $options['endpoint'] !== null) {
-            $event['endpoint'] = $options['endpoint'];
+            $event['endpoint'] = LlmEvents::wireEndpoint($options['endpoint']);
         }
         if (array_key_exists('latency_ms', $options) && $options['latency_ms'] !== null) {
             $event['latency_ms'] = (int) $options['latency_ms'];

@@ -25,7 +25,15 @@ final class MeteredHttpClient implements ClientInterface
     public function sendRequest(RequestInterface $request): ResponseInterface
     {
         [$request, $ctx] = $this->transport->beforeRequest($request);
-        $response = $this->client->sendRequest($request);
+        try {
+            $response = $this->client->sendRequest($request);
+        } catch (\Throwable $e) {
+            // Network error / timeout: record the failed call (as the gateway does), then rethrow unchanged.
+            if ($ctx !== null) {
+                $this->transport->onFailure($ctx, $e);
+            }
+            throw $e;
+        }
 
         return $ctx === null ? $response : $this->transport->afterResponse($ctx, $response);
     }

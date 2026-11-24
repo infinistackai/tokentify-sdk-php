@@ -32,7 +32,14 @@ final class MeteringMiddleware
 
         return static function (RequestInterface $request, array $options) use ($handler, $transport) {
             [$request, $ctx] = $transport->beforeRequest($request);
-            $promise = $handler($request, $options);
+            try {
+                $promise = $handler($request, $options);
+            } catch (\Throwable $e) {
+                if ($ctx !== null) {
+                    $transport->onFailure($ctx, $e);
+                }
+                throw $e;
+            }
             if ($ctx === null) {
                 return $promise;
             }
@@ -44,6 +51,23 @@ final class MeteringMiddleware
                     static fn ($response) => $response instanceof ResponseInterface
                         ? $transport->afterResponse($ctx, $response)
                         : $response,
+                    static function ($reason) use ($ctx, $transport) {
+                        // An error response turned into an exception by an inner middleware is metered from its
+                        // response; a network error / timeout is recorded as a failed call. Either way the
+                        // rejection reaches the caller unchanged.
+                        $response = is_object($reason) && method_exists($reason, 'getResponse') ? $reason->getResponse() : null;
+                        if ($response instanceof ResponseInterface) {
+                            $transport->afterResponse($ctx, $response);
+                        } elseif ($reason instanceof \Throwable) {
+                            $transport->onFailure($ctx, $reason);
+                        }
+
+                        if ($reason instanceof \Throwable) {
+                            throw $reason;
+                        }
+
+                        return \GuzzleHttp\Promise\Create::rejectionFor($reason);
+                    },
                 );
             }
 

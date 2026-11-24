@@ -11,6 +11,24 @@ final class LlmEvents
 {
     public const SDK_VERSION = '0.5.0';
 
+    /** SDK endpoint names => the path the gateway reports (bucket routing rules on `endpoint` use this form). */
+    public const WIRE_ENDPOINTS = [
+        'chat' => '/v1/chat/completions',
+        'completions' => '/v1/completions',
+        'responses' => '/v1/responses',
+        'messages' => '/v1/messages',
+        'embed' => '/v1/embeddings',
+        'audio/transcriptions' => '/v1/audio/transcriptions',
+        'audio/translations' => '/v1/audio/translations',
+        'audio/speech' => '/v1/audio/speech',
+    ];
+
+    /** The collector-facing endpoint for an SDK endpoint name; anything else passes through unchanged. */
+    public static function wireEndpoint(mixed $endpoint): mixed
+    {
+        return is_string($endpoint) && isset(self::WIRE_ENDPOINTS[$endpoint]) ? self::WIRE_ENDPOINTS[$endpoint] : $endpoint;
+    }
+
     /**
      * Merge explicit counts, alias keys, and parsed response usage.
      *
@@ -97,7 +115,7 @@ final class LlmEvents
         $tags['cache_read_tokens'] = $usage->cacheReadTokens;
         $tags['cache_write_tokens'] = $usage->cacheWriteTokens;
         if (($options['endpoint'] ?? null) !== null) {
-            $tags['endpoint'] = $options['endpoint'];
+            $tags['endpoint'] = self::wireEndpoint($options['endpoint']);
         }
         $provider = UsageParser::normalizeProvider((string) ($options['provider'] ?? ''));
         if ($provider !== '') {
@@ -122,8 +140,11 @@ final class LlmEvents
             'metadata' => $tags,
         ];
 
+        // As on the gateway: "reported" when the provider (or the caller) gave counts, "none" when there were none.
+        $hasUsage = $inputTokens > 0 || $usage->outputTokens > 0 || $usage->cacheReadTokens > 0 || $usage->cacheWriteTokens > 0;
+        $event['usage_source'] = (string) (($options['usage_source'] ?? '') ?: ($hasUsage ? 'reported' : 'none'));
         if (($options['endpoint'] ?? null) !== null) {
-            $event['endpoint'] = $options['endpoint'];
+            $event['endpoint'] = self::wireEndpoint($options['endpoint']);
         }
         if (($options['latency_ms'] ?? null) !== null) {
             $event['latency_ms'] = (int) $options['latency_ms'];
